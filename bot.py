@@ -70,6 +70,13 @@ MAX_IMAGE_BYTES = 15 * 1024 * 1024
 # Common image formats Discord may send without a content_type.
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
+# Set GGE_DEBUG=1 in Railway Variables to see why a screenshot was rejected.
+DEBUG = os.getenv("GGE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+def _debug(message: str) -> None:
+    if DEBUG:
+        print(f"[GGE][DEBUG] {message}")
+
 
 # =============================================================================
 # DATA TYPES
@@ -163,13 +170,19 @@ def _role_match(text: str) -> tuple[Optional[str], float]:
                 score = 1.0
             else:
                 score = SequenceMatcher(None, clean, target).ratio()
+                # If OCR glued the role to another word, compare sliding windows too.
+                if len(clean) > len(target):
+                    for i in range(len(clean) - len(target) + 1):
+                        part = clean[i:i + len(target)]
+                        score = max(score, SequenceMatcher(None, part, target).ratio())
 
             if score > best_score:
                 best_role = role
                 best_score = score
 
-    # Handles typical OCR variants such as "Utoénik" -> "utoenik".
-    if best_score < 0.72:
+    # Pair geometry and red-loss validation provide additional protection, so a
+    # slightly lower threshold improves recall on tiny/blurred screenshots.
+    if best_score < 0.66:
         return None, 0.0
 
     return best_role, best_score
@@ -196,17 +209,18 @@ def _decode_image(image_bytes: bytes) -> Optional[np.ndarray]:
     if img is None or img.size == 0:
         return None
 
-    # Cropped GGE report panels can be tiny (e.g. ~478x118). Upscaling before
-    # OCR gives Tesseract much more reliable character shapes.
+    # Normalize screenshot size. Tiny/cropped reports are enlarged; very large
+    # 4K screenshots are reduced so OCR stays fast on Railway.
     h, w = img.shape[:2]
-    if w < 900:
-        scale = min(4.0, max(2.0, 1400.0 / max(1, w)))
+    if w < 1400:
+        scale = min(4.0, 1400.0 / max(1, w))
         img = cv2.resize(
-            img,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC,
+            img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+        )
+    elif w > 2200:
+        scale = 2200.0 / w
+        img = cv2.resize(
+            img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
         )
 
     return img
@@ -257,9 +271,14 @@ def _find_role_labels(img: np.ndarray) -> list[LabelCandidate]:
     h, w = img.shape[:2]
     found: list[LabelCandidate] = []
 
-    # PSM 11 is strong on sparse UI text. PSM 6 is a useful second opinion.
-    for psm in (11, 6):
-        data = _ocr_dataframe(img, psm)
+    # OCR the raw screenshot plus a contrast-enhanced grayscale version.
+    # This costs one extra Tesseract pass but greatly helps small GGE UI text.
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    variants = ((img, 11), (img, 6), (clahe, 11))
+
+    for variant, psm in variants:
+        data = _ocr_dataframe(variant, psm)
 
         for i, raw_text in enumerate(data.get("text", [])):
             text = str(raw_text).strip()
@@ -283,17 +302,16 @@ def _find_role_labels(img: np.ndarray) -> list[LabelCandidate]:
 
             found.append(
                 LabelCandidate(
-                    role=role,
-                    score=score,
-                    x=x,
-                    y=y,
-                    w=bw,
-                    h=bh,
-                    text=text,
+                    role=role, score=score, x=x, y=y, w=bw, h=bh, text=text
                 )
             )
 
-    return _dedupe_labels(found, w, h)
+    labels = _dedupe_labels(found, w, h)
+    _debug(
+        "whole-screen roles: "
+        + ", ".join(f"{x.role}:{x.text!r}@{x.x},{x.y}({x.score:.2f})" for x in labels)
+    )
+    return labels
 
 
 # =============================================================================
@@ -610,6 +628,22 @@ def _extract_panel(img: np.ndarray, label: LabelCandidate) -> Optional[PanelData
     if loss is None:
         return None
 
+    # Whole-mask OCR can occasionally drop one digit on compressed Discord JPGs
+    # (e.g. 814 -> 84). Re-read the already-localized box on grayscale/threshold
+    # variants and use that consensus when it is strong.
+    try:
+        precise_value, precise_votes, precise_minus = _ocr_number_box_votes(
+            img, (loss.x, loss.y, loss.w, loss.h), signed=True
+        )
+    except NameError:
+        precise_value, precise_votes, precise_minus = None, 0, 0
+
+    if precise_value is not None and precise_votes >= 3 and precise_minus >= 1:
+        loss = NumberCandidate(
+            value=precise_value, x=loss.x, y=loss.y, w=loss.w, h=loss.h,
+            raw=f"-{precise_value}", score=loss.score + 1.0
+        )
+
     total = _read_total_above_loss(img, loss, minimum_value=loss.value)
     if total is None or total <= 0:
         return None
@@ -633,6 +667,534 @@ def _extract_panel(img: np.ndarray, label: LabelCandidate) -> Optional[PanelData
         loss_box=(loss.x, loss.y, loss.w, loss.h),
         structure_score=structure_score,
     )
+
+
+# =============================================================================
+# LOSS-ANCHOR FALLBACK
+# =============================================================================
+
+
+def _redish_component_boxes(img: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Find small red/reddish text-like rows without assuming a fixed layout."""
+    h, w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    b, g, r = cv2.split(img)
+
+    # Two complementary tests: HSV red and direct red-channel dominance.
+    hsv_red = (((hue <= 20) | (hue >= 162)) & (sat >= 55) & (val >= 95))
+    ri = r.astype(np.int16)
+    gi = g.astype(np.int16)
+    bi = b.astype(np.int16)
+    dominant_red = ((ri - gi >= 25) & (ri - bi >= 18) & (r >= 90))
+    mask = ((hsv_red | dominant_red).astype(np.uint8)) * 255
+
+    # Join characters on one row, but do not join separate panels.
+    kernel_w = max(3, int(round(w * 0.010)))
+    joined = cv2.dilate(
+        mask,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1)),
+        iterations=1,
+    )
+
+    count, _, stats, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    boxes: list[tuple[int, int, int, int]] = []
+
+    for i in range(1, count):
+        x, y, bw, bh, area = [int(v) for v in stats[i]]
+
+        if bh < max(3, int(h * 0.004)):
+            continue
+        if bh > max(45, int(h * 0.060)):
+            continue
+        if bw < max(8, int(w * 0.010)):
+            continue
+        if bw > int(w * 0.25):
+            continue
+
+        local = mask[y:y + bh, x:x + bw]
+        ys, xs = np.where(local > 0)
+        if len(xs) < 8:
+            continue
+
+        # Tighten back to the actual colored pixels after dilation.
+        ax = x + int(xs.min())
+        ay = y + int(ys.min())
+        aw = int(xs.max() - xs.min() + 1)
+        ah = int(ys.max() - ys.min() + 1)
+
+        if aw <= 1 or ah <= 2:
+            continue
+
+        boxes.append((ax, ay, aw, ah))
+
+    return boxes
+
+
+def _box_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    x, y, w, h = box
+    return x + w / 2.0, y + h / 2.0
+
+
+def _candidate_anchor_pairs(
+    img: np.ndarray, boxes: list[tuple[int, int, int, int]]
+) -> list[tuple[float, tuple[int, int, int, int], tuple[int, int, int, int]]]:
+    """Return geometrically plausible two-player rows, best first."""
+    h, w = img.shape[:2]
+    pairs = []
+
+    # The actual casualty summary is normally in the lower part of the report.
+    # This is a score bonus, not a hard layout coordinate.
+    usable = [b for b in boxes if _box_center(b)[1] >= 0.42 * h]
+
+    for i, a in enumerate(usable):
+        acx, acy = _box_center(a)
+        for b in usable[i + 1:]:
+            bcx, bcy = _box_center(b)
+            if bcx < acx:
+                left, right = b, a
+                lcx, lcy = bcx, bcy
+                rcx, rcy = acx, acy
+            else:
+                left, right = a, b
+                lcx, lcy = acx, acy
+                rcx, rcy = bcx, bcy
+
+            lh, rh = left[3], right[3]
+            ydiff = abs(lcy - rcy)
+            ytol = max(7.0, 1.10 * max(lh, rh), 0.018 * h)
+            if ydiff > ytol:
+                continue
+
+            separation = rcx - lcx
+            if separation < max(70.0, 0.16 * w):
+                continue
+            if separation > 0.82 * w:
+                continue
+
+            height_ratio = min(lh, rh) / max(1.0, max(lh, rh))
+            if height_ratio < 0.45:
+                continue
+
+            width_ratio = min(left[2], right[2]) / max(1.0, max(left[2], right[2]))
+            row_quality = max(0.0, 1.0 - ydiff / ytol)
+            bottom_bonus = ((lcy + rcy) / 2.0) / max(1.0, h)
+            separation_quality = min(1.0, separation / max(1.0, 0.35 * w))
+
+            score = (
+                2.0 * row_quality
+                + 0.7 * height_ratio
+                + 0.35 * width_ratio
+                + 0.65 * bottom_bonus
+                + 0.35 * separation_quality
+            )
+            pairs.append((score, left, right))
+
+    pairs.sort(key=lambda item: item[0], reverse=True)
+    return pairs[:10]
+
+
+def _role_from_region_text(text: str) -> tuple[Optional[str], float]:
+    """Find a role word inside a multi-word OCR region."""
+    best_role = None
+    best_score = 0.0
+
+    parts = re.findall(r"[A-Za-zÀ-ž]+", text)
+    parts.extend(line.strip() for line in text.splitlines() if line.strip())
+
+    for part in parts:
+        role, score = _role_match(part)
+        if role is not None and score > best_score:
+            best_role, best_score = role, score
+
+    return best_role, best_score
+
+
+def _ocr_role_near_anchor(
+    img: np.ndarray, box: tuple[int, int, int, int]
+) -> tuple[Optional[str], float, str]:
+    """Read Attacker/Defender in a generous region above a suspected number row."""
+    h, w = img.shape[:2]
+    x, y, bw, bh = box
+
+    x0 = max(0, int(x - 3.1 * bw - 0.020 * w))
+    x1 = min(w, int(x + 2.0 * bw + 0.015 * w))
+    y0 = max(0, int(y - 11.5 * bh - 0.010 * h))
+    y1 = max(0, int(y - 1.6 * bh))
+
+    if x1 <= x0 or y1 <= y0:
+        return None, 0.0, ""
+
+    crop = img[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None, 0.0, ""
+
+    target_h = 180
+    scale = max(1.5, target_h / max(1, crop.shape[0]))
+    scale = min(scale, 5.0)
+    big = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+
+    best_role: Optional[str] = None
+    best_score = 0.0
+    best_text = ""
+
+    for processed, psm in ((clahe, 6), (gray, 11)):
+        text = pytesseract.image_to_string(processed, config=f"--psm {psm}")
+        role, score = _role_from_region_text(text)
+        if score > best_score:
+            best_role, best_score, best_text = role, score, text
+        if best_score >= 0.92:
+            break
+
+    return best_role, best_score, best_text
+
+
+def _ocr_number_box_votes(
+    img: np.ndarray,
+    box: tuple[int, int, int, int],
+    signed: bool,
+) -> tuple[Optional[int], int, int]:
+    """OCR a tight number box; returns value, winning votes, minus-sign votes."""
+    x, y, bw, bh = [int(v) for v in box]
+    h, w = img.shape[:2]
+    pad_x = max(3, int(0.30 * bw))
+    pad_y = max(2, int(0.30 * bh))
+    x0, x1 = max(0, x - pad_x), min(w, x + bw + pad_x)
+    y0, y1 = max(0, y - pad_y), min(h, y + bh + pad_y)
+    crop = img[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None, 0, 0
+
+    votes: dict[int, int] = {}
+    minus_votes_by_value: dict[int, int] = {}
+
+    for scale in (4, 6):
+        big = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+        otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+        for processed in (gray, otsu):
+            for psm in (7, 8):
+                whitelist = "0123456789- " if signed else "0123456789 "
+                text = pytesseract.image_to_string(
+                    processed,
+                    config=f"--psm {psm} -c tessedit_char_whitelist={whitelist}",
+                )
+                digits = re.sub(r"[^0-9]", "", text)
+                if not digits:
+                    continue
+                try:
+                    value = int(digits)
+                except ValueError:
+                    continue
+                if value > 20_000_000:
+                    continue
+                votes[value] = votes.get(value, 0) + 1
+                if "-" in text:
+                    minus_votes_by_value[value] = minus_votes_by_value.get(value, 0) + 1
+
+    if not votes:
+        return None, 0, 0
+
+    value = max(votes, key=lambda v: (votes[v], -len(str(v))))
+    return value, votes[value], minus_votes_by_value.get(value, 0)
+
+
+def _find_total_box_above(
+    loss_box: tuple[int, int, int, int],
+    boxes: list[tuple[int, int, int, int]],
+) -> Optional[tuple[int, int, int, int]]:
+    lx, ly, lw, lh = loss_box
+    lcx, _ = _box_center(loss_box)
+    candidates = []
+
+    for box in boxes:
+        if box == loss_box:
+            continue
+        x, y, bw, bh = box
+        cx, cy = _box_center(box)
+        vertical_gap = ly - (y + bh)
+        if vertical_gap < -0.35 * lh:
+            continue
+        if vertical_gap > 3.8 * max(lh, bh):
+            continue
+        if abs(cx - lcx) > max(0.95 * max(lw, bw), 22.0):
+            continue
+        height_ratio = min(lh, bh) / max(1.0, max(lh, bh))
+        if height_ratio < 0.40:
+            continue
+
+        score = (
+            2.0 * height_ratio
+            - 0.035 * abs(cx - lcx)
+            - 0.05 * abs(vertical_gap - 0.7 * lh)
+        )
+        candidates.append((score, box))
+
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _analyze_by_loss_anchors(img: np.ndarray) -> Optional[BattleResult]:
+    """Fallback: locate the casualty row first, then determine roles around it."""
+    boxes = _redish_component_boxes(img)
+    pairs = _candidate_anchor_pairs(img, boxes)
+    _debug(f"anchor fallback: {len(boxes)} colored boxes, {len(pairs)} row pairs")
+
+    detections: list[tuple[float, BattleResult]] = []
+
+    for geom_score, left_box, right_box in pairs:
+        left_role, left_role_score, left_text = _ocr_role_near_anchor(img, left_box)
+        right_role, right_role_score, right_text = _ocr_role_near_anchor(img, right_box)
+
+        # At least one side must explicitly tell us the role. If only one is
+        # readable, the opposite panel can safely be inferred from the paired UI.
+        if left_role is None and right_role is None:
+            continue
+        if left_role is not None and right_role is not None and left_role == right_role:
+            continue
+
+        if left_role is None:
+            left_role = "defender" if right_role == "attacker" else "attacker"
+            left_role_score = 0.58
+        if right_role is None:
+            right_role = "defender" if left_role == "attacker" else "attacker"
+            right_role_score = 0.58
+
+        left_value, left_votes, left_minus = _ocr_number_box_votes(img, left_box, signed=True)
+        right_value, right_votes, right_minus = _ocr_number_box_votes(img, right_box, signed=True)
+        if left_value is None or right_value is None:
+            continue
+
+        # This specifically rejects the total-troops row just above casualties.
+        if left_minus == 0 or right_minus == 0:
+            continue
+
+        if left_role == "attacker":
+            attacker_loss, attacker_box = left_value, left_box
+            defender_loss, defender_box = right_value, right_box
+        else:
+            attacker_loss, attacker_box = right_value, right_box
+            defender_loss, defender_box = left_value, left_box
+
+        # Prefer the paired colored component directly above the defender loss.
+        total_box = _find_total_box_above(defender_box, boxes)
+        defender_total = None
+        total_votes = 0
+        if total_box is not None:
+            defender_total, total_votes, _ = _ocr_number_box_votes(
+                img, total_box, signed=False
+            )
+
+        # If component geometry did not expose the total row, use the older
+        # OCR-above-loss routine as a final local fallback.
+        if defender_total is None or defender_total < defender_loss:
+            synthetic_loss = NumberCandidate(
+                value=defender_loss,
+                x=defender_box[0], y=defender_box[1],
+                w=defender_box[2], h=defender_box[3],
+                raw=f"-{defender_loss}", score=1.0,
+            )
+            defender_total = _read_total_above_loss(
+                img, synthetic_loss, minimum_value=defender_loss
+            )
+            total_votes = 1 if defender_total is not None else 0
+
+        if defender_total is None or defender_total <= 0:
+            continue
+        if defender_loss > defender_total:
+            continue
+
+        confidence = (
+            geom_score
+            + left_role_score
+            + right_role_score
+            + min(1.0, left_votes / 4.0)
+            + min(1.0, right_votes / 4.0)
+            + min(1.0, total_votes / 4.0)
+        )
+
+        result = BattleResult(
+            attacker_loss=attacker_loss,
+            defender_loss=defender_loss,
+            defender_total=defender_total,
+            confidence=confidence,
+        )
+        detections.append((confidence, result))
+        _debug(
+            f"anchor candidate roles={left_role}/{right_role}, "
+            f"losses={left_value}/{right_value}, defender_total={defender_total}, "
+            f"score={confidence:.2f}; text={left_text!r} | {right_text!r}"
+        )
+
+    if not detections:
+        return None
+
+    detections.sort(key=lambda item: item[0], reverse=True)
+    best_score, best = detections[0]
+
+    if len(detections) > 1:
+        second_score, second = detections[1]
+        materially_different = (
+            best.attacker_loss != second.attacker_loss
+            or best.defender_loss != second.defender_loss
+            or best.defender_total != second.defender_total
+        )
+        if materially_different and best_score - second_score < 0.40:
+            _debug("anchor fallback ambiguous: rejecting close competing detections")
+            return None
+
+    return best
+
+
+# =============================================================================
+# SINGLE-ROLE RESCUE
+# =============================================================================
+
+
+def _find_opposite_loss_same_row(
+    img: np.ndarray, known_panel: PanelData
+) -> Optional[NumberCandidate]:
+    """Find the other player's red loss on the same horizontal casualty row."""
+    h, w = img.shape[:2]
+    kx, ky, kw, kh = known_panel.loss_box
+    known_cx = kx + kw / 2.0
+    known_cy = ky + kh / 2.0
+
+    if known_cx >= w / 2.0:
+        x0 = 0
+        x1 = max(1, min(int(w * 0.58), int(kx - 0.035 * w)))
+    else:
+        x0 = min(w - 1, max(int(w * 0.42), int(kx + kw + 0.035 * w)))
+        x1 = w
+
+    y0 = max(0, int(ky - 1.5 * kh))
+    y1 = min(h, int(ky + 2.1 * kh))
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    crop = img[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None
+
+    mask = _red_text_mask(crop)
+    candidates: list[NumberCandidate] = []
+
+    for psm in (7, 11, 6):
+        data = pytesseract.image_to_data(
+            mask,
+            config=f"--psm {psm} -c tessedit_char_whitelist=0123456789- ",
+            output_type=pytesseract.Output.DICT,
+        )
+        candidates.extend(_group_numeric_tokens(data, x0, y0))
+
+    if not candidates:
+        return None
+
+    # Keep only numbers tightly aligned to the known casualty row.
+    aligned = []
+    for cand in candidates:
+        if abs(cand.cy - known_cy) > max(8.0, 1.8 * kh):
+            continue
+        if cand.value > 20_000_000:
+            continue
+        aligned.append(cand)
+
+    if not aligned:
+        return None
+
+    # Vote by value across PSM modes, then choose the most row-aligned reading.
+    grouped: dict[int, list[NumberCandidate]] = {}
+    for cand in aligned:
+        grouped.setdefault(cand.value, []).append(cand)
+
+    best_value = max(
+        grouped,
+        key=lambda value: (
+            len(grouped[value]),
+            max(c.score for c in grouped[value]),
+            len(str(value)),
+        ),
+    )
+    best = min(grouped[best_value], key=lambda c: abs(c.cy - known_cy))
+
+    # Tight-box re-read guards against a dropped digit after compression.
+    precise, votes, minus_votes = _ocr_number_box_votes(
+        img, (best.x, best.y, best.w, best.h), signed=True
+    )
+    if precise is not None and votes >= 3:
+        best = NumberCandidate(
+            value=precise,
+            x=best.x, y=best.y, w=best.w, h=best.h,
+            raw=f"-{precise}" if minus_votes else str(precise),
+            score=best.score + votes,
+        )
+
+    return best
+
+
+def _analyze_from_single_role(
+    img: np.ndarray, labels: list[LabelCandidate]
+) -> Optional[BattleResult]:
+    """If only one role OCRs, infer the opposite side from the aligned loss row."""
+    detections: list[tuple[float, BattleResult]] = []
+
+    for label in sorted(labels, key=lambda x: x.score, reverse=True):
+        panel = _extract_panel(img, label)
+        if panel is None:
+            continue
+
+        opposite = _find_opposite_loss_same_row(img, panel)
+        if opposite is None:
+            continue
+
+        if label.role == "defender":
+            attacker_loss = opposite.value
+            defender_loss = panel.loss
+            defender_total = panel.total
+        else:
+            attacker_loss = panel.loss
+            defender_loss = opposite.value
+            defender_total = _read_total_above_loss(
+                img, opposite, minimum_value=defender_loss
+            )
+            if defender_total is None:
+                continue
+
+        if attacker_loss < 0 or defender_loss < 0:
+            continue
+        if defender_total <= 0 or defender_loss > defender_total:
+            continue
+
+        score = panel.structure_score + label.score + 1.0
+        detections.append((
+            score,
+            BattleResult(
+                attacker_loss=attacker_loss,
+                defender_loss=defender_loss,
+                defender_total=defender_total,
+                confidence=score,
+            ),
+        ))
+        _debug(
+            f"single-role rescue via {label.role}: "
+            f"A={attacker_loss}, D={defender_loss}/{defender_total}"
+        )
+
+    if not detections:
+        return None
+    detections.sort(key=lambda item: item[0], reverse=True)
+    best_score, best = detections[0]
+    if len(detections) > 1:
+        second_score, second = detections[1]
+        if (
+            (best.attacker_loss, best.defender_loss, best.defender_total)
+            != (second.attacker_loss, second.defender_loss, second.defender_total)
+            and best_score - second_score < 0.35
+        ):
+            return None
+    return best
 
 
 # =============================================================================
@@ -679,29 +1241,23 @@ def _pair_score(attacker: PanelData, defender: PanelData, img: np.ndarray) -> Op
     )
 
 
-def analyze_battle_report(image_bytes: bytes) -> Optional[BattleResult]:
-    """Analyze one screenshot. Returns None if the battle panel is uncertain."""
-    img = _decode_image(image_bytes)
-    if img is None:
-        return None
-
+def _analyze_by_role_labels(img: np.ndarray) -> Optional[BattleResult]:
+    """Fast primary detector: explicit role labels -> local loss rows."""
     labels = _find_role_labels(img)
     attackers = [label for label in labels if label.role == "attacker"]
     defenders = [label for label in labels if label.role == "defender"]
 
     if not attackers or not defenders:
-        return None
+        _debug("role-label detector: only one role type found; trying aligned-row rescue")
+        return _analyze_from_single_role(img, labels)
 
-    # Only run the heavier number OCR around labels that can plausibly pair on
-    # the same row. This also prevents random role words elsewhere on the screen
-    # from becoming valid battle panels.
     panel_cache: dict[LabelCandidate, Optional[PanelData]] = {}
     scored_pairs: list[tuple[float, PanelData, PanelData]] = []
     img_h, _ = img.shape[:2]
 
     for att_label in attackers:
         for def_label in defenders:
-            if abs(att_label.cy - def_label.cy) > max(25.0, 0.10 * img_h):
+            if abs(att_label.cy - def_label.cy) > max(30.0, 0.12 * img_h):
                 continue
 
             if att_label not in panel_cache:
@@ -711,30 +1267,23 @@ def analyze_battle_report(image_bytes: bytes) -> Optional[BattleResult]:
 
             attacker = panel_cache[att_label]
             defender = panel_cache[def_label]
-
             if attacker is None or defender is None:
                 continue
 
             score = _pair_score(attacker, defender, img)
             if score is None:
                 continue
-
-            # Logical checks: losses cannot exceed pre-battle troop totals.
-            if attacker.loss > attacker.total:
+            if attacker.loss > attacker.total or defender.loss > defender.total:
                 continue
-            if defender.loss > defender.total:
-                continue
-
             scored_pairs.append((score, attacker, defender))
 
     if not scored_pairs:
-        return None
+        _debug("role-label detector: labels found, but no valid panel pair; trying single-role rescue")
+        return _analyze_from_single_role(img, labels)
 
     scored_pairs.sort(key=lambda item: item[0], reverse=True)
     best_score, attacker, defender = scored_pairs[0]
 
-    # If there are two almost-equally-good but materially different detections,
-    # fail safely rather than guess.
     if len(scored_pairs) > 1:
         second_score, second_att, second_def = scored_pairs[1]
         materially_different = (
@@ -742,7 +1291,8 @@ def analyze_battle_report(image_bytes: bytes) -> Optional[BattleResult]:
             or second_def.loss != defender.loss
             or second_def.total != defender.total
         )
-        if materially_different and (best_score - second_score) < 0.35:
+        if materially_different and (best_score - second_score) < 0.30:
+            _debug("role-label detector ambiguous: trying anchor fallback")
             return None
 
     return BattleResult(
@@ -751,6 +1301,38 @@ def analyze_battle_report(image_bytes: bytes) -> Optional[BattleResult]:
         defender_total=defender.total,
         confidence=best_score,
     )
+
+
+def analyze_battle_report(image_bytes: bytes) -> Optional[BattleResult]:
+    """Analyze one screenshot using two independent detection strategies."""
+    img = _decode_image(image_bytes)
+    if img is None:
+        _debug("image decode failed")
+        return None
+
+    _debug(f"image size after normalization: {img.shape[1]}x{img.shape[0]}")
+
+    # Strategy 1 is quick and very precise when both role labels OCR correctly.
+    result = _analyze_by_role_labels(img)
+    if result is not None:
+        _debug(
+            f"accepted by role-label detector: A={result.attacker_loss}, "
+            f"D={result.defender_loss}/{result.defender_total}"
+        )
+        return result
+
+    # Strategy 2 starts from the paired casualty row. This rescues screenshots
+    # where whole-screen OCR misses one role label because of scale/compression.
+    result = _analyze_by_loss_anchors(img)
+    if result is not None:
+        _debug(
+            f"accepted by anchor detector: A={result.attacker_loss}, "
+            f"D={result.defender_loss}/{result.defender_total}"
+        )
+        return result
+
+    _debug("no reliable battle panel detected")
+    return None
 
 
 # =============================================================================
@@ -847,7 +1429,7 @@ def create_discord_client():
     @client.event
     async def on_ready():
         print(f"[GGE] Logged in as {client.user} (ID: {client.user.id})")
-        print("[GGE] Waiting for Goodgame Empire report screenshots...")
+        print("[GGE] Robust OCR ready. Waiting for Goodgame Empire report screenshots...")
 
     @client.event
     async def on_message(message):
@@ -901,6 +1483,8 @@ def _preflight() -> None:
     try:
         version = pytesseract.get_tesseract_version()
         print(f"[GGE] Tesseract OCR: {version}")
+        if DEBUG:
+            print("[GGE][DEBUG] Debug logging is ON")
     except pytesseract.TesseractNotFoundError as exc:
         raise SystemExit(
             "Tesseract OCR nebol nájdený. Nainštaluj Tesseract a prípadne "
