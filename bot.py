@@ -272,7 +272,7 @@ async def on_message(message: discord.Message):
         attacker_loss, defender_loss = result
         ratio = format_ratio(attacker_loss, defender_loss)
         await message.reply(
-    f"**Battle Report ratio is: {ratio.replace(',', '.')}**",
+    f"**Battle Report ratio is {ratio.replace(',', '.')}**",
     mention_author=False,
 )
 
