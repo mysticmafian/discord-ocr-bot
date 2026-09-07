@@ -1176,6 +1176,471 @@ def _analyze_cropped_report_v4(img_bgr: np.ndarray):
 
 
 
+
+# ---------------------------------------------------------------------------
+# OCR V5: dynamická detekcia panelov v CELOM / odfotenom screenshote
+# ---------------------------------------------------------------------------
+
+def _best_role_anchor_from_data(df, role: str, y_offset=0, scale=1.0):
+    """
+    Nájde najlepší OCR box pre Obranca/Defender alebo Útočník/Attacker.
+    """
+    if role == "defender":
+        targets = ("obranca", "defender")
+    else:
+        targets = ("utocnik", "attacker")
+
+    best = None
+    best_score = 0.0
+
+    for _, row in df.iterrows():
+        raw = str(row.get("text", "") or "").strip()
+        if not raw:
+            continue
+
+        clean = _normalize_text(raw)
+        if not clean:
+            continue
+
+        score = _role_score(clean, targets)
+
+        try:
+            conf = float(row.get("conf", 0))
+        except Exception:
+            conf = 0.0
+
+        # OCR môže mať pri moiré fotke nízku confidence, preto je podobnosť
+        # názvu dôležitejšia než samotná confidence.
+        combined = score + max(0.0, conf) / 500.0
+
+        if score >= 0.52 and combined > best_score:
+            x = int(float(row["left"]) / scale)
+            y = int(float(row["top"]) / scale) + y_offset
+            w = int(float(row["width"]) / scale)
+            h = int(float(row["height"]) / scale)
+
+            best = {
+                "x": x,
+                "y": y,
+                "w": max(1, w),
+                "h": max(1, h),
+                "cx": x + max(1, w) / 2,
+                "cy": y + max(1, h) / 2,
+                "score": score,
+                "text": raw,
+            }
+            best_score = combined
+
+    return best
+
+
+def _find_role_anchors_dynamic(img_bgr: np.ndarray):
+    """
+    Nájde hlavičky Obranca/Defender a Útočník/Attacker bez pevných súradníc.
+
+    Toto je určené najmä pre:
+    - celý screenshot,
+    - fotografiu monitora/mobilu,
+    - screenshot s okrajmi okolo hry.
+    """
+    H, W = img_bgr.shape[:2]
+
+    # Battle report býva v dolnej polovici obrazovky.
+    y0 = int(0.38 * H)
+    region = img_bgr[y0:int(0.94 * H), :]
+
+    if region.size == 0:
+        return None
+
+    scale = 2.0
+    big = cv2.resize(
+        region,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    variants = [big]
+
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+    otsu = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )[1]
+    variants.append(cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR))
+
+    best_def = None
+    best_att = None
+
+    for variant in variants:
+        for psm in (6, 11, 12):
+            try:
+                df = pytesseract.image_to_data(
+                    variant,
+                    config=f"--psm {psm}",
+                    output_type=pytesseract.Output.DATAFRAME,
+                )
+            except Exception:
+                continue
+
+            df = df.dropna(subset=["text"])
+
+            defender = _best_role_anchor_from_data(
+                df,
+                "defender",
+                y_offset=y0,
+                scale=scale,
+            )
+            attacker = _best_role_anchor_from_data(
+                df,
+                "attacker",
+                y_offset=y0,
+                scale=scale,
+            )
+
+            if defender is not None:
+                if best_def is None or defender["score"] > best_def["score"]:
+                    best_def = defender
+
+            if attacker is not None:
+                if best_att is None or attacker["score"] > best_att["score"]:
+                    best_att = attacker
+
+    if best_def is None or best_att is None:
+        return None
+
+    # Musia byť dva rôzne panely.
+    if abs(best_def["cx"] - best_att["cx"]) < 0.12 * W:
+        return None
+
+    # Hlavičky by mali byť približne na rovnakej výške.
+    if abs(best_def["cy"] - best_att["cy"]) > 0.10 * H:
+        return None
+
+    return best_def, best_att
+
+
+def _find_red_loss_box_near_anchor(img_bgr: np.ndarray, anchor):
+    """
+    Nájde červené stratové číslo POD konkrétnou hlavičkou panelu.
+
+    Už nehľadáme "ľavú" alebo "pravú" stranu celej fotky.
+    Hľadáme lokálne okolo OCR pozície slova Obranca/Defender/Útočník/Attacker.
+    """
+    H, W = img_bgr.shape[:2]
+
+    cx = anchor["cx"]
+    label_y = anchor["y"]
+    label_h = max(anchor["h"], int(0.012 * H))
+
+    # Čísla sú pod hlavičkou a viac smerom do stredu panelu.
+    xa = max(0, int(cx - 0.11 * W))
+    xb = min(W, int(cx + 0.13 * W))
+
+    ya = max(0, int(label_y + 1.3 * label_h))
+    yb = min(H, int(label_y + max(9.0 * label_h, 0.13 * H)))
+
+    crop = img_bgr[ya:yb, xa:xb]
+
+    if crop.size == 0:
+        return None
+
+    # Pri odfotenej obrazovke je červená často "vyblednutá" kvôli moiré.
+    b, g, r = cv2.split(crop)
+    r16 = r.astype(np.int16)
+    strongest_other = np.maximum(g, b).astype(np.int16)
+
+    red_mask = np.where(
+        (r16 > 90)
+        & ((r16 - strongest_other) > 18),
+        255,
+        0,
+    ).astype(np.uint8)
+
+    # HSV doplnková maska.
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hsv_mask = (
+        cv2.inRange(
+            hsv,
+            np.array([0, 45, 55]),
+            np.array([20, 255, 255]),
+        )
+        |
+        cv2.inRange(
+            hsv,
+            np.array([160, 45, 55]),
+            np.array([180, 255, 255]),
+        )
+    )
+
+    mask = cv2.bitwise_or(red_mask, hsv_mask)
+
+    # Odstránenie drobného moiré šumu.
+    mask = cv2.medianBlur(mask, 3)
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+
+    components = []
+
+    for i in range(1, count):
+        x, y, cw, ch, area = stats[i]
+
+        min_h = max(3, int(0.012 * H))
+        max_h = max(min_h + 1, int(0.055 * H))
+
+        if (
+            min_h <= ch <= max_h
+            and area >= max(5, int(0.000003 * W * H))
+            and cw <= 0.10 * W
+        ):
+            components.append((x + xa, y + ya, cw, ch, area))
+
+    if not components:
+        return None
+
+    # Zoskupenie komponentov do horizontálnych riadkov.
+    groups = []
+
+    for comp in sorted(components, key=lambda c: c[1] + c[3] / 2):
+        cy = comp[1] + comp[3] / 2
+
+        matched = False
+        for group in groups:
+            if abs(cy - group["cy"]) <= max(4, 0.012 * H):
+                group["items"].append(comp)
+                group["cy"] = sum(
+                    c[1] + c[3] / 2 for c in group["items"]
+                ) / len(group["items"])
+                matched = True
+                break
+
+        if not matched:
+            groups.append({"cy": cy, "items": [comp]})
+
+    candidates = []
+
+    for group in groups:
+        items = group["items"]
+
+        # Reálne loss číslo má typicky viac červených komponentov.
+        if len(items) < 2:
+            continue
+
+        xs = [c[0] for c in items]
+        ys = [c[1] for c in items]
+        x2s = [c[0] + c[2] for c in items]
+        y2s = [c[1] + c[3] for c in items]
+
+        box = (
+            min(xs),
+            min(ys),
+            max(x2s) - min(xs),
+            max(y2s) - min(ys),
+        )
+
+        bw, bh = box[2], box[3]
+
+        # Číselný riadok je širší než jedna náhodná ikonka.
+        if bw < max(12, int(0.018 * W)):
+            continue
+
+        # Preferujeme spodnejší riadok pod hlavičkou,
+        # pretože strata je pod celkovým počtom vojska.
+        score = group["cy"] + 0.15 * bw + 2.0 * len(items)
+        candidates.append((score, box))
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _ocr_total_dynamic(img_bgr: np.ndarray, loss_box, loss_value=None):
+    """
+    Prečíta horný počet vojska relatívne k presne nájdenému loss boxu.
+    Vhodné aj pre fotku monitora.
+    """
+    x, y, w, h = [int(v) for v in loss_box]
+    H, W = img_bgr.shape[:2]
+
+    candidates = []
+
+    windows = (
+        (2.4, 0.30),
+        (2.8, 0.45),
+        (2.1, 0.25),
+        (3.1, 0.60),
+    )
+
+    for top_mul, bottom_mul in windows:
+        x0 = max(0, x - int(0.45 * w))
+        x1 = min(W, x + w + int(0.45 * w))
+        y0 = max(0, y - int(top_mul * h))
+        y1 = max(0, y - int(bottom_mul * h))
+
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        crop = img_bgr[y0:y1, x0:x1]
+
+        if crop.size == 0:
+            continue
+
+        for scale in (3, 4, 6):
+            big = cv2.resize(
+                crop,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+            gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+
+            # Mierne odšumenie pomáha pri fotografii LCD/monitoru.
+            gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+
+            otsu = cv2.threshold(
+                gray_blur,
+                0,
+                255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+            )[1]
+
+            adaptive = cv2.adaptiveThreshold(
+                gray_blur,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                7,
+            )
+
+            for processed in (gray, otsu, adaptive):
+                for psm in (7, 8, 13):
+                    text = pytesseract.image_to_string(
+                        processed,
+                        config=(
+                            f"--psm {psm} "
+                            "-c tessedit_char_whitelist=0123456789 "
+                        ),
+                    )
+
+                    digits = re.sub(r"[^0-9]", "", text)
+
+                    if digits:
+                        try:
+                            value = int(digits)
+                        except ValueError:
+                            continue
+
+                        if value > 0:
+                            candidates.append(value)
+
+    if not candidates:
+        return None
+
+    counts = {}
+    for value in candidates:
+        counts[value] = counts.get(value, 0) + 1
+
+    valid = list(counts)
+
+    if loss_value is not None:
+        logical = [v for v in valid if v >= loss_value]
+        if logical:
+            valid = logical
+
+    return max(
+        valid,
+        key=lambda v: (
+            counts[v],
+            1 if loss_value is None or v > loss_value else 0,
+            -len(str(v)),
+        ),
+    )
+
+
+def _analyze_dynamic_full_report_v5(img_bgr: np.ndarray):
+    """
+    V5 režim pre celý screenshot / fotografiu monitora.
+
+    Nepoužíva pevné Y súradnice.
+    Najprv cez OCR nájde slová Obranca/Defender a Útočník/Attacker,
+    potom podľa nich lokalizuje čísla.
+    """
+    anchors = _find_role_anchors_dynamic(img_bgr)
+
+    if anchors is None:
+        return None
+
+    defender_anchor, attacker_anchor = anchors
+
+    defender_box = _find_red_loss_box_near_anchor(
+        img_bgr,
+        defender_anchor,
+    )
+
+    attacker_box = _find_red_loss_box_near_anchor(
+        img_bgr,
+        attacker_anchor,
+    )
+
+    if defender_box is None or attacker_box is None:
+        return None
+
+    # Najprv hard-mode OCR strát.
+    defender_candidates = _ocr_candidates_v3(
+        img_bgr,
+        defender_box,
+    )
+    attacker_candidates = _ocr_candidates_v3(
+        img_bgr,
+        attacker_box,
+    )
+
+    # Total obrancu čítame najskôr bez obmedzenia,
+    # následne použijeme matematickú kontrolu.
+    defender_total_rough = _ocr_total_dynamic(
+        img_bgr,
+        defender_box,
+        None,
+    )
+
+    defender_loss = _ocr_loss_consensus_v4(
+        img_bgr,
+        defender_box,
+        defender_total_rough,
+    )
+
+    attacker_loss = _ocr_loss_consensus_v4(
+        img_bgr,
+        attacker_box,
+        None,
+    )
+
+    if defender_loss is None or attacker_loss is None:
+        return None
+
+    defender_total = _ocr_total_dynamic(
+        img_bgr,
+        defender_box,
+        defender_loss,
+    )
+
+    if defender_total is None or defender_total <= 0:
+        return None
+
+    if defender_loss > defender_total:
+        return None
+
+    return attacker_loss, defender_loss, defender_total
+
+
+
 # ---------------------------------------------------------------------------
 # LAYOUTY BATTLE REPORTU
 # ---------------------------------------------------------------------------
@@ -1272,15 +1737,23 @@ def analyze_battle_report(image_bytes: bytes):
     h, w = img.shape[:2]
     aspect = w / max(1, h)
 
-    # V4 HARD MODE pre orezané battle reporty:
-    # loss čísla sa OCR čítajú po jednotlivých čísliciach.
+    # V4 HARD MODE pre široké orezané battle reporty.
     if aspect >= 2.5:
         precise = _analyze_cropped_report_v4(img)
 
         if precise is not None:
             return precise
 
-    # Fallback pre celé screenshoty alebo atypický orez.
+    # V5 DYNAMIC MODE:
+    # funguje pre celý screenshot aj fotografiu monitora.
+    # Hlavičky Obranca/Defender a Útočník/Attacker nájde cez OCR,
+    # takže report nemusí byť v pevnej časti obrázka.
+    dynamic = _analyze_dynamic_full_report_v5(img)
+
+    if dynamic is not None:
+        return dynamic
+
+    # Posledný fallback pre staršie layouty.
     for panels in _get_layouts(img):
         left, right = panels
 
