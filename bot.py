@@ -455,6 +455,253 @@ def _read_panel_values(
     return total, loss
 
 
+
+# ---------------------------------------------------------------------------
+# V7 FAST PATH PRE OREZANE REPORTY
+# ---------------------------------------------------------------------------
+
+def _ocr_side_panel_cropped(img_bgr: np.ndarray, side: str):
+    """
+    Pri širokom orezanom reporte OCRujeme každý bočný panel zvlášť.
+
+    Toto je rýchlejšie a hlavne spoľahlivejšie než OCR celého reportu,
+    pretože stredné odmeny/ikony už nemôžu pomýliť čísla vojska.
+    """
+    H, W = img_bgr.shape[:2]
+
+    if side == "left":
+        xa, xb = 0, int(0.31 * W)
+    else:
+        xa, xb = int(0.69 * W), W
+
+    panel = img_bgr[:, xa:xb]
+
+    if panel.size == 0:
+        return None
+
+    # Malý panel výrazne zväčšíme. Stále je to rýchle, lebo OCRujeme
+    # iba približne tretinu malého obrázka.
+    scale = max(2.0, 700.0 / max(1, panel.shape[1]))
+    scale = min(scale, 6.0)
+
+    big = cv2.resize(
+        panel,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+
+    data = pytesseract.image_to_data(
+        gray,
+        config="--psm 11",
+        output_type=Output.DICT,
+    )
+
+    text_tokens = []
+    numeric_tokens = []
+
+    count = len(data.get("text", []))
+
+    for i in range(count):
+        text = str(data["text"][i]).strip()
+
+        if not text:
+            continue
+
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = 0.0
+
+        x = float(data["left"][i]) / scale
+        y = float(data["top"][i]) / scale
+        w = float(data["width"][i]) / scale
+        h = float(data["height"][i]) / scale
+
+        text_tokens.append(text)
+
+        digits = re.sub(r"[^0-9]", "", text)
+
+        if digits:
+            numeric_tokens.append({
+                "text": text,
+                "digits": digits,
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "conf": conf,
+            })
+
+    # Určenie roly panelu. Stačí, keď spoľahlivo nájdeme Obranca/Defender
+    # na jednej strane; druhá strana je potom útočník.
+    joined_text = " ".join(text_tokens)
+
+    defender_score = _is_defender(joined_text)
+    attacker_score = _is_attacker(joined_text)
+
+    # Zoskupíme čísla podľa horizontálneho riadku.
+    groups = []
+
+    for item in sorted(
+        numeric_tokens,
+        key=lambda item: item["y"] + item["h"] / 2,
+    ):
+        cy = item["y"] + item["h"] / 2
+
+        # Herné total/loss čísla sú približne v strednej/spodnej časti panelu.
+        # Horné bonusy alebo dátumy týmto odfiltrujeme.
+        if cy < 0.28 * H or cy > 0.86 * H:
+            continue
+
+        placed = False
+
+        for group in groups:
+            if abs(cy - group["cy"]) <= max(3.0, 0.035 * H):
+                group["items"].append(item)
+                group["cy"] = sum(
+                    i["y"] + i["h"] / 2
+                    for i in group["items"]
+                ) / len(group["items"])
+                placed = True
+                break
+
+        if not placed:
+            groups.append({
+                "cy": cy,
+                "items": [item],
+            })
+
+    parsed = []
+
+    for group in groups:
+        items = sorted(
+            group["items"],
+            key=lambda item: item["x"],
+        )
+
+        digits = "".join(item["digits"] for item in items)
+
+        if not digits:
+            continue
+
+        try:
+            value = int(digits)
+        except ValueError:
+            continue
+
+        parsed.append({
+            "cy": group["cy"],
+            "value": value,
+            "has_minus": any("-" in item["text"] for item in items),
+            "confidence": (
+                sum(max(0.0, item["conf"]) for item in items)
+                / max(1, len(items))
+            ),
+        })
+
+    parsed.sort(key=lambda row: row["cy"])
+
+    # Hľadáme dvojicu susedných číselných riadkov:
+    # horný = total, spodný = loss.
+    best_pair = None
+    best_score = None
+
+    for i in range(len(parsed) - 1):
+        total_row = parsed[i]
+        loss_row = parsed[i + 1]
+
+        gap = loss_row["cy"] - total_row["cy"]
+
+        if gap <= 0:
+            continue
+
+        # Pri rôznych výškach cropu môže byť rozostup rôzny,
+        # ale stále ide o dva blízke riadky.
+        if gap > 0.22 * H:
+            continue
+
+        total = total_row["value"]
+        loss = loss_row["value"]
+
+        if total <= 0 or loss <= 0 or loss > total:
+            continue
+
+        score = 0.0
+
+        # Mínus na spodnom riadku je veľmi silný signál.
+        if loss_row["has_minus"]:
+            score += 5.0
+
+        score += min(2.0, loss_row["confidence"] / 50.0)
+        score += min(2.0, total_row["confidence"] / 50.0)
+
+        # Preferujeme nižšiu dvojicu, pretože total/loss je pod názvom hráča.
+        score += loss_row["cy"] / max(1.0, H)
+
+        if best_score is None or score > best_score:
+            best_score = score
+            best_pair = (total, loss)
+
+    if best_pair is None:
+        return None
+
+    total, loss = best_pair
+
+    return {
+        "total": total,
+        "loss": loss,
+        "defender_score": defender_score,
+        "attacker_score": attacker_score,
+    }
+
+
+def _analyze_cropped_v7(img_bgr: np.ndarray):
+    """
+    Rýchla a deterministická analýza širokého orezaného reportu.
+    """
+    left = _ocr_side_panel_cropped(img_bgr, "left")
+    right = _ocr_side_panel_cropped(img_bgr, "right")
+
+    if left is None or right is None:
+        return None
+
+    # Ktorá strana je obranca?
+    left_role = left["defender_score"] + right["attacker_score"]
+    right_role = right["defender_score"] + left["attacker_score"]
+
+    if max(left_role, right_role) < 0.45:
+        # Ak OCR nezachytil Útočník, stále stačí samotný Obranca/Defender.
+        if left["defender_score"] > right["defender_score"]:
+            left_role = 1.0
+            right_role = 0.0
+        elif right["defender_score"] > left["defender_score"]:
+            right_role = 1.0
+            left_role = 0.0
+        else:
+            return None
+
+    if left_role > right_role:
+        defender = left
+        attacker = right
+    else:
+        defender = right
+        attacker = left
+
+    if defender["loss"] > defender["total"]:
+        return None
+
+    return (
+        attacker["loss"],
+        defender["loss"],
+        defender["total"],
+    )
+
+
+
 # ---------------------------------------------------------------------------
 # MAIN ANALYSIS
 # ---------------------------------------------------------------------------
@@ -467,7 +714,25 @@ def analyze_battle_report(image_bytes: bytes):
         return None
 
     H, W = img.shape[:2]
+    aspect = W / max(1, H)
 
+    # V7 FAST PATH:
+    # široké orezané reporty idú cez dva malé bočné OCR panely.
+    # Je to rýchle a nepletú sa do toho stredné bonusy/ikony.
+    if aspect >= 2.5:
+        cropped_result = _analyze_cropped_v7(img)
+
+        if cropped_result is not None:
+            print(
+                "OCR V7 cropped:",
+                cropped_result,
+                flush=True,
+            )
+            return cropped_result
+
+    # Celý screenshot alebo fotografia obrazovky:
+    # použije sa dynamický V6 režim, ktorý lokalizuje Obranca/Defender
+    # podľa textu v spodnej časti obrázka.
     rows, cropped_mode = _ocr_rows(img)
 
     if not rows:
@@ -523,11 +788,19 @@ def analyze_battle_report(image_bytes: bytes):
     defender_total, defender_loss = defender_values
     _, attacker_loss = attacker_values
 
-    return (
+    result = (
         attacker_loss,
         defender_loss,
         defender_total,
     )
+
+    print(
+        "OCR V7 full/photo:",
+        result,
+        flush=True,
+    )
+
+    return result
 
 
 def format_ratio(attacker_loss: int, defender_loss: int) -> str:
