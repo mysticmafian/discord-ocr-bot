@@ -10,6 +10,7 @@ takže obranca môže byť napravo aj naľavo.
 import os
 import re
 from difflib import SequenceMatcher
+import unicodedata
 
 import cv2
 import numpy as np
@@ -97,30 +98,43 @@ def _ocr_label(img_bgr: np.ndarray, rect) -> str:
     return " ".join(texts)
 
 
-def _defender_score(text: str) -> float:
+def _normalize_text(text: str) -> str:
+    """Odstráni diakritiku a nechá iba písmená a-z."""
+    text = unicodedata.normalize("NFKD", text.lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z]", "", text)
+
+
+def _role_score(text: str, targets) -> float:
     """
-    Skóre podobnosti k slovám Obranca / Defender.
-    Pomáha aj keď OCR spraví malú chybu.
+    Skóre podobnosti OCR textu k názvu roly.
+    Používame obe roly, aby sa strany nemohli ľahko prehodiť.
     """
-    clean = re.sub(r"[^a-z]", "", text.lower())
+    clean = _normalize_text(text)
     if not clean:
         return 0.0
-
-    targets = ("obranca", "defender")
 
     if any(target in clean for target in targets):
         return 1.0
 
     scores = []
     for target in targets:
-        # porovná aj menšie kúsky OCR textu
         scores.append(SequenceMatcher(None, clean, target).ratio())
 
-        for i in range(max(1, len(clean) - len(target) + 1)):
-            part = clean[i:i + len(target)]
-            scores.append(SequenceMatcher(None, part, target).ratio())
+        if len(clean) >= len(target):
+            for i in range(len(clean) - len(target) + 1):
+                part = clean[i:i + len(target)]
+                scores.append(SequenceMatcher(None, part, target).ratio())
 
     return max(scores, default=0.0)
+
+
+def _defender_score(text: str) -> float:
+    return _role_score(text, ("obranca", "defender"))
+
+
+def _attacker_score(text: str) -> float:
+    return _role_score(text, ("utocnik", "attacker"))
 
 
 def _extract_integer(text: str):
@@ -369,80 +383,101 @@ def _ocr_precise_number_box(img_bgr: np.ndarray, box):
     )
 
 
-def _ocr_total_above_loss(img_bgr: np.ndarray, loss_box):
+def _ocr_total_above_loss(img_bgr: np.ndarray, loss_box, defender_loss=None):
     """
-    Celkový počet vojska je priamo nad červenými stratami.
-    Preto ho čítame relatívne k už presne nájdenému loss boxu.
+    Prečíta celkový počet vojska z riadku priamo NAD stratami.
+
+    Skúšame niekoľko úzkych vertikálnych posunov. Ak poznáme defender_loss,
+    preferujeme hodnotu >= strata a pri viacerých výsledkoch tú, na ktorej
+    sa OCR zhodne najčastejšie.
     """
     x, y, w, h = [int(v) for v in loss_box]
     img_h, img_w = img_bgr.shape[:2]
 
-    x0 = max(0, x - int(0.35 * w))
-    x1 = min(img_w, x + w + int(0.35 * w))
-
-    y0 = max(0, y - int(2.4 * h))
-    y1 = max(0, y - int(0.35 * h))
-
-    if x1 <= x0 or y1 <= y0:
-        return None
-
-    crop = img_bgr[y0:y1, x0:x1]
-
-    if crop.size == 0:
-        return None
+    # Celkový počet je v rovnakom stĺpci ako strata, približne o 1 riadok vyššie.
+    rects = [
+        (
+            max(0, x - int(0.45 * w)),
+            max(0, y - int(2.10 * h)),
+            min(img_w, x + w + int(0.45 * w)),
+            max(0, y - int(0.35 * h)),
+        ),
+        (
+            max(0, x - int(0.35 * w)),
+            max(0, y - int(1.90 * h)),
+            min(img_w, x + w + int(0.35 * w)),
+            max(0, y - int(0.55 * h)),
+        ),
+        (
+            max(0, x - int(0.55 * w)),
+            max(0, y - int(2.30 * h)),
+            min(img_w, x + w + int(0.55 * w)),
+            max(0, y - int(0.45 * h)),
+        ),
+    ]
 
     candidates = []
 
-    for scale in (4, 6, 8):
-        big = cv2.resize(
-            crop,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC,
-        )
+    for x0, y0, x1, y1 in rects:
+        if x1 <= x0 or y1 <= y0:
+            continue
 
-        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+        crop = img_bgr[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
 
-        otsu = cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-        )[1]
+        for scale in (4, 6, 8):
+            big = cv2.resize(
+                crop,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC,
+            )
 
-        for processed in (gray, otsu):
-            for psm in (7, 8, 13):
-                text = pytesseract.image_to_string(
-                    processed,
-                    config=(
-                        f"--psm {psm} "
-                        "-c tessedit_char_whitelist=0123456789 "
-                    ),
-                )
+            gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+            otsu = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )[1]
 
-                digits = re.sub(r"[^0-9]", "", text)
+            for processed in (gray, otsu):
+                for psm in (7, 8, 13):
+                    text = pytesseract.image_to_string(
+                        processed,
+                        config=(
+                            f"--psm {psm} "
+                            "-c tessedit_char_whitelist=0123456789 "
+                        ),
+                    )
 
-                if digits:
-                    try:
-                        candidates.append(int(digits))
-                    except ValueError:
-                        pass
+                    value = _extract_integer(text)
+                    if value is not None:
+                        candidates.append(value)
 
     if not candidates:
         return None
 
     counts = {}
-
     for value in candidates:
         counts[value] = counts.get(value, 0) + 1
 
+    if defender_loss is not None:
+        valid = [v for v in counts if v >= defender_loss]
+        if valid:
+            # Pri rovnakej zhode preferuj číslo, ktoré nie je presne strata,
+            # pretože to často znamená, že OCR omylom čítalo spodný riadok.
+            return max(
+                valid,
+                key=lambda v: (
+                    counts[v],
+                    1 if v > defender_loss else 0,
+                    -len(str(v)),
+                ),
+            )
+
     return max(
         counts,
-        key=lambda value: (
-            counts[value],
-            -len(str(value)),
-        ),
+        key=lambda v: (counts[v], -len(str(v))),
     )
 
 
@@ -465,10 +500,17 @@ def _analyze_cropped_report_precise(img_bgr: np.ndarray):
         (0.65, 0.00, 1.00, 0.27),
     )
 
-    left_score = _defender_score(left_label)
-    right_score = _defender_score(right_label)
+    left_def = _defender_score(left_label)
+    right_def = _defender_score(right_label)
+    left_att = _attacker_score(left_label)
+    right_att = _attacker_score(right_label)
 
-    if max(left_score, right_score) < 0.50:
+    # Vyberieme orientáciu, ktorá najlepšie sedí na OBE hlavičky:
+    # Obranca/Defender na jednej strane a Útočník/Attacker na druhej.
+    left_is_defender_score = left_def + right_att
+    right_is_defender_score = right_def + left_att
+
+    if max(left_is_defender_score, right_is_defender_score) < 0.80:
         return None
 
     left_loss_box = _find_red_loss_bbox_cropped(
@@ -495,12 +537,13 @@ def _analyze_cropped_report_precise(img_bgr: np.ndarray):
     if left_loss is None or right_loss is None:
         return None
 
-    if left_score > right_score:
+    if left_is_defender_score > right_is_defender_score:
         defender_loss = left_loss
         attacker_loss = right_loss
         defender_total = _ocr_total_above_loss(
             img_bgr,
             left_loss_box,
+            defender_loss,
         )
     else:
         defender_loss = right_loss
@@ -508,6 +551,7 @@ def _analyze_cropped_report_precise(img_bgr: np.ndarray):
         defender_total = _ocr_total_above_loss(
             img_bgr,
             right_loss_box,
+            defender_loss,
         )
 
     if defender_total is None or defender_total <= 0:
@@ -632,13 +676,18 @@ def analyze_battle_report(image_bytes: bytes):
         left_label = _ocr_label(img, left["label"])
         right_label = _ocr_label(img, right["label"])
 
-        left_score = _defender_score(left_label)
-        right_score = _defender_score(right_label)
+        left_def = _defender_score(left_label)
+        right_def = _defender_score(right_label)
+        left_att = _attacker_score(left_label)
+        right_att = _attacker_score(right_label)
 
-        if max(left_score, right_score) < 0.55:
+        left_is_defender_score = left_def + right_att
+        right_is_defender_score = right_def + left_att
+
+        if max(left_is_defender_score, right_is_defender_score) < 0.80:
             continue
 
-        if left_score > right_score:
+        if left_is_defender_score > right_is_defender_score:
             defender_panel = left
             attacker_panel = right
         else:
