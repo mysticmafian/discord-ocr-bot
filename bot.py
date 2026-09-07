@@ -1,76 +1,37 @@
 """
-Discord bot: automaticky rozpozna screenshot battle reportu (výpis boja)
-a odpovie s pomerom strát vojska medzi útočníkom a obrancom.
+Discord bot: rozpozna battle report a odpovie:
+- pomerom strát útočník : obranca
+- percentom obrancovej armády, ktorú útočník zabil
 
-Princíp:
-1. V obrázku nájdeme červené (stratové) čísla pomocou farebnej masky v HSV.
-2. Z nájdených "blobov" vyberieme dvojicu, ktorá vyzerá ako dve čísla
-   na rovnakej výške, na opačných stranách obrázka (ľavá strana = útočník,
-   pravá strana = obranca) - presne ako v UI hry.
-3. Každé číslo prečítame cez OCR (Tesseract) a vypočítame pomer.
-
-Toto NEspolieha na presné pixelové súradnice, takže by malo fungovať
-aj pri rôznych rozlíšeniach screenshotu (mobil / PC / rôzny zoom),
-pokiaľ farba stratových čísel ostáva červená a layout je podobný.
+Bot rozozná stranu obrancu podľa textu "Obranca" alebo "Defender",
+takže obranca môže byť napravo aj naľavo.
 """
 
-import io
 import os
 import re
+from difflib import SequenceMatcher
 
 import cv2
 import numpy as np
 import pytesseract
 import discord
 
+
 # ---------------------------------------------------------------------------
 # KONFIGURÁCIA
 # ---------------------------------------------------------------------------
 
-# Token bota - najlepšie ako premenná prostredia, aby nebol v kóde.
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "VLOZ_SI_TU_TOKEN")
-
-# Ak chceš, aby bot reagoval len v konkrétnych kanáloch, vypíš ich ID sem.
-# Prázdny zoznam = reaguje vo všetkých kanáloch, kam má prístup.
-ALLOWED_CHANNEL_IDS = []  # napr. [123456789012345678]
-
-# Ak sa nepodarí rozpoznať dve čísla, bot môže na správu reagovať emoji,
-# aby bolo jasné, že screenshot nevie spracovať. Nastav na None, ak nechceš.
+ALLOWED_CHANNEL_IDS = []
 FAILURE_REACTION = ""
 
-# Windows: ak Tesseract nie je v PATH, odkomentuj a nastav cestu, napr.:
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
 
 # ---------------------------------------------------------------------------
-# ROZPOZNÁVANIE ČÍSEL V OBRÁZKU
+# OCR POMOCNÉ FUNKCIE
 # ---------------------------------------------------------------------------
 
-def _extract_negative_numbers(text: str):
-    """
-    Z OCR textu vytiahne záporné čísla.
-    Funguje aj pri medzerách: "-5 488" -> 5488.
-    """
-    results = []
-    for match in re.finditer(r"-\s*([0-9][0-9\s]{0,14})", text):
-        digits = re.sub(r"[^0-9]", "", match.group(1))
-        if digits:
-            try:
-                results.append(int(digits))
-            except ValueError:
-                pass
-    return results
-
-
-def _ocr_loss_from_roi(img_bgr: np.ndarray, rect):
-    """
-    Prečíta stratové číslo z relatívneho výrezu obrázka.
-
-    rect = (x0, y0, x1, y1), všetko v rozsahu 0..1.
-
-    Namiesto spoliehania sa iba na presný odtieň červenej skúšame viac
-    OCR variantov. To je spoľahlivejšie pri zmenšených Discord obrázkoch.
-    """
+def _crop_relative(img_bgr: np.ndarray, rect):
+    """Vyreže relatívny obdĺžnik (x0, y0, x1, y1), hodnoty 0..1."""
     h, w = img_bgr.shape[:2]
     x0, y0, x1, y1 = rect
 
@@ -80,11 +41,15 @@ def _ocr_loss_from_roi(img_bgr: np.ndarray, rect):
     yb = max(0, min(h, int(y1 * h)))
 
     crop = img_bgr[ya:yb, xa:xb]
-    if crop.size == 0:
-        return None
+    return crop if crop.size else None
 
-    # Malé Discord náhľady výrazne zväčšíme.
-    target_h = 260
+
+def _prepare_variants(crop: np.ndarray):
+    """Vytvorí viac verzií výrezu, aby mal Tesseract vyššiu šancu."""
+    if crop is None or crop.size == 0:
+        return []
+
+    target_h = 180
     scale = max(2.0, target_h / max(1, crop.shape[0]))
     scale = min(scale, 8.0)
 
@@ -102,101 +67,190 @@ def _ocr_loss_from_roi(img_bgr: np.ndarray, rect):
         gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )[1]
 
-    # Variant zameraný na výrazne červený text.
-    b, g, r = cv2.split(big)
-    strongest_other = np.maximum(g, b).astype(np.int16)
-    red_dominance = r.astype(np.int16) - strongest_other
-    red_only = np.where(
-        (r > 135) & (red_dominance > 35),
-        0,
+    adaptive = cv2.adaptiveThreshold(
+        gray,
         255,
-    ).astype(np.uint8)
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        9,
+    )
 
+    return [gray, otsu, adaptive]
+
+
+def _ocr_label(img_bgr: np.ndarray, rect) -> str:
+    """OCR textového nadpisu panelu."""
+    crop = _crop_relative(img_bgr, rect)
+    texts = []
+
+    for processed in _prepare_variants(crop):
+        for psm in (7, 6):
+            text = pytesseract.image_to_string(
+                processed,
+                config=f"--psm {psm}",
+            )
+            text = re.sub(r"[^A-Za-zÀ-ž]", "", text).lower()
+            if text:
+                texts.append(text)
+
+    return " ".join(texts)
+
+
+def _defender_score(text: str) -> float:
+    """
+    Skóre podobnosti k slovám Obranca / Defender.
+    Pomáha aj keď OCR spraví malú chybu.
+    """
+    clean = re.sub(r"[^a-z]", "", text.lower())
+    if not clean:
+        return 0.0
+
+    targets = ("obranca", "defender")
+
+    if any(target in clean for target in targets):
+        return 1.0
+
+    scores = []
+    for target in targets:
+        # porovná aj menšie kúsky OCR textu
+        scores.append(SequenceMatcher(None, clean, target).ratio())
+
+        for i in range(max(1, len(clean) - len(target) + 1)):
+            part = clean[i:i + len(target)]
+            scores.append(SequenceMatcher(None, part, target).ratio())
+
+    return max(scores, default=0.0)
+
+
+def _extract_integer(text: str):
+    """Z OCR textu vyberie číslice: '138 318' -> 138318."""
+    digits = re.sub(r"[^0-9]", "", text)
+    if not digits:
+        return None
+
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+def _ocr_number_from_roi(img_bgr: np.ndarray, rect):
+    """
+    Prečíta jedno číslo zo známeho riadku.
+    Pri strate nepotrebujeme mínus - ROI už presne určuje riadok strát.
+    """
+    crop = _crop_relative(img_bgr, rect)
     candidates = []
 
-    # PSM 6: blok textu; PSM 11: riedky text.
-    # Pri jednom screenshote býva lepší 6, pri inom 11.
-    for processed in (gray, otsu, red_only):
-        for psm in (6, 11):
+    for processed in _prepare_variants(crop):
+        for psm in (7, 8, 13):
             text = pytesseract.image_to_string(
                 processed,
                 config=(
                     f"--psm {psm} "
-                    "-c tessedit_char_whitelist=0123456789- "
+                    "-c tessedit_char_whitelist=0123456789 "
                 ),
             )
-            candidates.extend(_extract_negative_numbers(text))
+            value = _extract_integer(text)
+            if value is not None:
+                candidates.append(value)
 
     if not candidates:
         return None
 
-    # Ak OCR ten istý výsledok zachytí viackrát, uprednostníme ho.
-    # Pri zhode frekvencie preferujeme väčšie číslo, pretože strata
-    # je zvyčajne viacmiestna a tým odfiltrujeme drobné OCR artefakty.
     counts = {}
     for value in candidates:
         counts[value] = counts.get(value, 0) + 1
 
+    # Preferuj výsledok, ktorý OCR zopakovalo najčastejšie.
     return max(counts, key=lambda value: (counts[value], value))
 
 
-def _analyze_known_layouts(img_bgr: np.ndarray):
-    """
-    Skúsi známe rozloženia battle reportu.
+# ---------------------------------------------------------------------------
+# LAYOUTY BATTLE REPORTU
+# ---------------------------------------------------------------------------
 
-    Podporuje:
-    1. celý screenshot hry,
-    2. orezaný spodný battle-report panel.
+def _get_layouts(img_bgr: np.ndarray):
+    """
+    Vráti dvojice panelov. Každý panel má:
+    label = Obranca/Defender alebo Útočník/Attacker
+    total = počet vojska pred stratou
+    loss  = počet strateného vojska
     """
     h, w = img_bgr.shape[:2]
     aspect = w / max(1, h)
 
-    layouts = []
-
-    # Orezaný report je veľmi široký a nízky.
     if aspect >= 2.5:
-        layouts.append((
-            (0.04, 0.52, 0.34, 0.98),   # útočník
-            (0.69, 0.52, 0.995, 0.98),  # obranca
-        ))
+        # OREZANÝ battle report
+        return [
+            [
+                {
+                    "label": (0.00, 0.00, 0.31, 0.25),
+                    "total": (0.13, 0.52, 0.31, 0.75),
+                    "loss":  (0.13, 0.69, 0.31, 0.94),
+                },
+                {
+                    "label": (0.69, 0.00, 1.00, 0.25),
+                    "total": (0.82, 0.52, 0.995, 0.75),
+                    "loss":  (0.82, 0.69, 0.995, 0.94),
+                },
+            ],
+            # Širší fallback pre trochu inak orezané reporty
+            [
+                {
+                    "label": (0.00, 0.00, 0.40, 0.30),
+                    "total": (0.10, 0.46, 0.39, 0.76),
+                    "loss":  (0.10, 0.67, 0.39, 1.00),
+                },
+                {
+                    "label": (0.60, 0.00, 1.00, 0.30),
+                    "total": (0.70, 0.46, 1.00, 0.76),
+                    "loss":  (0.70, 0.67, 1.00, 1.00),
+                },
+            ],
+        ]
 
-        # O niečo širší fallback pre rôzne orezy.
-        layouts.append((
-            (0.00, 0.42, 0.40, 1.00),
-            (0.62, 0.42, 1.00, 1.00),
-        ))
+    # CELÝ SCREENSHOT
+    return [
+        [
+            {
+                "label": (0.015, 0.680, 0.190, 0.718),
+                "total": (0.090, 0.775, 0.185, 0.805),
+                "loss":  (0.090, 0.800, 0.185, 0.835),
+            },
+            {
+                "label": (0.415, 0.680, 0.595, 0.718),
+                "total": (0.500, 0.775, 0.590, 0.805),
+                "loss":  (0.500, 0.800, 0.590, 0.835),
+            },
+        ],
+        # Fallback s mierne väčšími výrezmi
+        [
+            {
+                "label": (0.010, 0.665, 0.205, 0.730),
+                "total": (0.075, 0.760, 0.200, 0.815),
+                "loss":  (0.075, 0.795, 0.200, 0.850),
+            },
+            {
+                "label": (0.405, 0.665, 0.610, 0.730),
+                "total": (0.480, 0.760, 0.605, 0.815),
+                "loss":  (0.480, 0.795, 0.605, 0.850),
+            },
+        ],
+    ]
 
-    # Celý screenshot – battle report je dole.
-    else:
-        layouts.append((
-            (0.025, 0.765, 0.205, 0.855),  # útočník
-            (0.425, 0.765, 0.600, 0.855),  # obranca
-        ))
 
-        # Fallback s väčším výrezom.
-        layouts.append((
-            (0.015, 0.720, 0.230, 0.890),
-            (0.405, 0.720, 0.625, 0.890),
-        ))
-
-    for attacker_rect, defender_rect in layouts:
-        attacker_loss = _ocr_loss_from_roi(img_bgr, attacker_rect)
-        defender_loss = _ocr_loss_from_roi(img_bgr, defender_rect)
-
-        if attacker_loss is not None and defender_loss is not None:
-            return attacker_loss, defender_loss
-
-    return None
-
+# ---------------------------------------------------------------------------
+# ANALÝZA REPORTU
+# ---------------------------------------------------------------------------
 
 def analyze_battle_report(image_bytes: bytes):
     """
-    Hlavná funkcia.
-
     Vráti:
-        (attacker_loss, defender_loss)
+        (attacker_loss, defender_loss, defender_total)
 
-    alebo None, ak OCR straty nerozpozná.
+    defender_total = počet obrancov pred bitkou.
     """
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -204,11 +258,43 @@ def analyze_battle_report(image_bytes: bytes):
     if img is None:
         return None
 
-    return _analyze_known_layouts(img)
+    for panels in _get_layouts(img):
+        left, right = panels
+
+        left_label = _ocr_label(img, left["label"])
+        right_label = _ocr_label(img, right["label"])
+
+        left_score = _defender_score(left_label)
+        right_score = _defender_score(right_label)
+
+        # Musíme vedieť, ktorá strana je Obranca / Defender.
+        if max(left_score, right_score) < 0.55:
+            continue
+
+        if left_score > right_score:
+            defender_panel = left
+            attacker_panel = right
+        else:
+            defender_panel = right
+            attacker_panel = left
+
+        attacker_loss = _ocr_number_from_roi(img, attacker_panel["loss"])
+        defender_loss = _ocr_number_from_roi(img, defender_panel["loss"])
+        defender_total = _ocr_number_from_roi(img, defender_panel["total"])
+
+        if (
+            attacker_loss is not None
+            and defender_loss is not None
+            and defender_total is not None
+            and defender_total > 0
+        ):
+            return attacker_loss, defender_loss, defender_total
+
+    return None
 
 
 def format_ratio(attacker_loss: int, defender_loss: int) -> str:
-    """Naformátuje výsledok ako 'X : Y', kde menšia strana = 1."""
+    """Pomer strát útočník : obranca."""
     if attacker_loss == 0 or defender_loss == 0:
         return f"{attacker_loss} : {defender_loss}"
 
@@ -219,9 +305,21 @@ def format_ratio(attacker_loss: int, defender_loss: int) -> str:
     def fmt(v: float) -> str:
         if abs(v - round(v)) < 0.05:
             return str(int(round(v)))
-        return str(round(v, 2)).replace(".", ",")
+        return f"{v:.2f}".rstrip("0").rstrip(".")
 
     return f"{fmt(left)} : {fmt(right)}"
+
+
+def format_defender_killed_percent(defender_loss: int, defender_total: int) -> str:
+    """
+    Vypočíta percento zabitých obrancov:
+        strata obrancu / počet obrancov pred bitkou * 100
+    """
+    if defender_total <= 0:
+        return "0"
+
+    percent = (defender_loss / defender_total) * 100
+    return f"{percent:.1f}".rstrip("0").rstrip(".")
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +327,7 @@ def format_ratio(attacker_loss: int, defender_loss: int) -> str:
 # ---------------------------------------------------------------------------
 
 intents = discord.Intents.default()
-intents.message_content = True  # nutné pre čítanie príloh v obsahu správy
+intents.message_content = True
 
 client = discord.Client(intents=intents)
 
@@ -251,6 +349,7 @@ async def on_message(message: discord.Message):
         a for a in message.attachments
         if a.content_type and a.content_type.startswith("image/")
     ]
+
     if not image_attachments:
         return
 
@@ -261,6 +360,7 @@ async def on_message(message: discord.Message):
             continue
 
         result = analyze_battle_report(image_bytes)
+
         if result is None:
             if FAILURE_REACTION:
                 try:
@@ -269,18 +369,25 @@ async def on_message(message: discord.Message):
                     pass
             continue
 
-        attacker_loss, defender_loss = result
+        attacker_loss, defender_loss, defender_total = result
+
         ratio = format_ratio(attacker_loss, defender_loss)
+        killed_percent = format_defender_killed_percent(
+            defender_loss,
+            defender_total,
+        )
+
         await message.reply(
-    f"**Battle Report ratio is:   {ratio.replace(',', '.')}**",
-    mention_author=False,
-)
+            f"**Battle Report ratio is: {ratio}**\n"
+            f"**Defenders killed: {killed_percent}%**",
+            mention_author=False,
+        )
 
 
 if __name__ == "__main__":
     if TOKEN == "VLOZ_SI_TU_TOKEN":
         raise SystemExit(
-            "Nastav token bota - buď premennú prostredia DISCORD_BOT_TOKEN, "
-            "alebo priamo v premennej TOKEN v tomto súbore."
+            "Nastav token bota cez premennú prostredia DISCORD_BOT_TOKEN."
         )
+
     client.run(TOKEN)
