@@ -1,1436 +1,890 @@
 """
-Discord bot: rozpozna battle report a odpovie:
-- pomerom strát útočník : obranca
-- percentom obrancovej armády, ktorú útočník zabil
+Goodgame Empire battle-report analyzer for an existing Discord bot.
 
-Bot rozozná stranu obrancu podľa textu "Obranca" alebo "Defender",
-takže obranca môže byť napravo aj naľavo.
+What it does
+------------
+- Accepts a full screenshot OR a cropped battle report.
+- Finds the actual Attacker/Defender result-panel pair by layout + validation,
+  so unrelated occurrences of the words elsewhere on screen are ignored.
+- Supports Slovak and English role labels (with fuzzy OCR matching).
+- Attacker/Defender may be on either side.
+- Extracts total troops and losses from both result panels.
+- Calculates only:
+    Battle ratio = defender losses / attacker losses  ->  X.XX : 1
+    Straty obrancu = defender losses / defender total -> percent
+- Fails safely (returns None) when the result panel cannot be verified.
+
+Dependencies
+------------
+Python packages:
+    pip install opencv-python-headless numpy pytesseract
+
+System package:
+    Tesseract OCR must be installed and available on PATH.
+
+This file intentionally DOES NOT create a Discord client and DOES NOT contain
+any token/channel settings. Import it into your existing bot and call
+`process_discord_message(message)` from your existing on_message listener.
 """
 
+from __future__ import annotations
+
+import asyncio
 import os
 import re
-from difflib import SequenceMatcher
 import unicodedata
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from typing import Iterable, Optional
 
 import cv2
 import numpy as np
 import pytesseract
-import discord
+from pytesseract import Output
+
+
+# Optional runtime configuration. These are analyzer settings, not Discord settings.
+TESSERACT_LANG = os.getenv("GGE_TESSERACT_LANG", "eng")
+TESSERACT_CMD = os.getenv("GGE_TESSERACT_CMD", "").strip()
+if TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+ROLE_ALIASES = {
+    "attacker": ("utocnik", "attacker"),
+    "defender": ("obranca", "defender"),
+}
+
+
+@dataclass(frozen=True)
+class Box:
+    x: float
+    y: float
+    w: float
+    h: float
+
+    @property
+    def cx(self) -> float:
+        return self.x + self.w / 2.0
+
+    @property
+    def cy(self) -> float:
+        return self.y + self.h / 2.0
+
+
+@dataclass(frozen=True)
+class OCRItem:
+    text: str
+    conf: float
+    box: Box
+
+
+@dataclass(frozen=True)
+class RoleAnchor:
+    role: str
+    score: float
+    item: OCRItem
+
+
+@dataclass(frozen=True)
+class PanelValues:
+    total: int
+    loss: int
+    confidence: float
+    total_box: Box
+
+
+@dataclass(frozen=True)
+class BattleAnalysis:
+    attacker_total: int
+    attacker_loss: int
+    defender_total: int
+    defender_loss: int
+    confidence: float
+
+    @property
+    def battle_ratio(self) -> Optional[float]:
+        if self.attacker_loss <= 0:
+            return None
+        return self.defender_loss / self.attacker_loss
+
+    @property
+    def defender_loss_percent(self) -> float:
+        if self.defender_total <= 0:
+            return 0.0
+        return self.defender_loss / self.defender_total * 100.0
 
 
 # ---------------------------------------------------------------------------
-# KONFIGURÁCIA
+# Text helpers
 # ---------------------------------------------------------------------------
-
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "VLOZ_SI_TU_TOKEN")
-ALLOWED_CHANNEL_IDS = []
-FAILURE_REACTION = ""
-
-
-# ---------------------------------------------------------------------------
-# OCR POMOCNÉ FUNKCIE
-# ---------------------------------------------------------------------------
-
-def _crop_relative(img_bgr: np.ndarray, rect):
-    """Vyreže relatívny obdĺžnik (x0, y0, x1, y1), hodnoty 0..1."""
-    h, w = img_bgr.shape[:2]
-    x0, y0, x1, y1 = rect
-
-    xa = max(0, min(w, int(x0 * w)))
-    ya = max(0, min(h, int(y0 * h)))
-    xb = max(0, min(w, int(x1 * w)))
-    yb = max(0, min(h, int(y1 * h)))
-
-    crop = img_bgr[ya:yb, xa:xb]
-    return crop if crop.size else None
-
-
-def _prepare_variants(crop: np.ndarray):
-    """Vytvorí viac verzií výrezu, aby mal Tesseract vyššiu šancu."""
-    if crop is None or crop.size == 0:
-        return []
-
-    target_h = 180
-    scale = max(2.0, target_h / max(1, crop.shape[0]))
-    scale = min(scale, 8.0)
-
-    big = cv2.resize(
-        crop,
-        None,
-        fx=scale,
-        fy=scale,
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
-
-    otsu = cv2.threshold(
-        gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )[1]
-
-    adaptive = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        9,
-    )
-
-    return [gray, otsu, adaptive]
-
-
-def _ocr_label(img_bgr: np.ndarray, rect) -> str:
-    """OCR textového nadpisu panelu."""
-    crop = _crop_relative(img_bgr, rect)
-    texts = []
-
-    for processed in _prepare_variants(crop):
-        for psm in (7, 6):
-            text = pytesseract.image_to_string(
-                processed,
-                config=f"--psm {psm}",
-            )
-            text = re.sub(r"[^A-Za-zÀ-ž]", "", text).lower()
-            if text:
-                texts.append(text)
-
-    return " ".join(texts)
 
 
 def _normalize_text(text: str) -> str:
-    """Odstráni diakritiku a nechá iba písmená a-z."""
-    text = unicodedata.normalize("NFKD", text.lower())
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    return re.sub(r"[^a-z]", "", text)
+    """Normalize OCR text so accents / mild OCR damage matter less."""
+    s = unicodedata.normalize("NFKD", str(text).lower())
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+
+    # Common OCR substitutions seen in UI fonts.
+    s = s.replace("0", "o").replace("1", "i").replace("|", "i")
+    return re.sub(r"[^a-z]", "", s)
 
 
-def _role_score(text: str, targets) -> float:
-    """
-    Skóre podobnosti OCR textu k názvu roly.
-    Používame obe roly, aby sa strany nemohli ľahko prehodiť.
-    """
+def _role_similarity(text: str, role: str) -> float:
     clean = _normalize_text(text)
     if not clean:
         return 0.0
 
-    if any(target in clean for target in targets):
-        return 1.0
-
-    scores = []
-    for target in targets:
-        scores.append(SequenceMatcher(None, clean, target).ratio())
-
-        if len(clean) >= len(target):
-            for i in range(len(clean) - len(target) + 1):
-                part = clean[i:i + len(target)]
-                scores.append(SequenceMatcher(None, part, target).ratio())
-
-    return max(scores, default=0.0)
+    best = 0.0
+    for target in ROLE_ALIASES[role]:
+        if target in clean:
+            return 1.0
+        best = max(best, SequenceMatcher(None, clean, target).ratio())
+    return best
 
 
-def _defender_score(text: str) -> float:
-    return _role_score(text, ("obranca", "defender"))
-
-
-def _attacker_score(text: str) -> float:
-    return _role_score(text, ("utocnik", "attacker"))
-
-
-def _extract_integer(text: str):
-    """Z OCR textu vyberie číslice: '138 318' -> 138318."""
-    digits = re.sub(r"[^0-9]", "", text)
+def _parse_int(text: str) -> Optional[int]:
+    """Read 12 205 / 12,205 / -5488 / 5.488 as an integer."""
+    digits = re.sub(r"[^0-9]", "", str(text))
     if not digits:
         return None
-
     try:
         return int(digits)
     except ValueError:
         return None
 
 
-def _ocr_number_from_roi(img_bgr: np.ndarray, rect):
-    """
-    Prečíta jedno číslo zo známeho riadku.
-    Pri strate nepotrebujeme mínus - ROI už presne určuje riadok strát.
-    """
-    crop = _crop_relative(img_bgr, rect)
-    candidates = []
+# ---------------------------------------------------------------------------
+# OCR helpers
+# ---------------------------------------------------------------------------
 
-    for processed in _prepare_variants(crop):
-        for psm in (7, 8, 13):
-            text = pytesseract.image_to_string(
-                processed,
-                config=(
-                    f"--psm {psm} "
-                    "-c tessedit_char_whitelist=0123456789 "
+
+def _resize_for_ocr(img: np.ndarray, target_width: int = 1900) -> tuple[np.ndarray, float]:
+    h, w = img.shape[:2]
+    if w <= 0:
+        return img, 1.0
+
+    # Small cropped reports need much more enlargement than full screenshots.
+    scale = target_width / float(w)
+    scale = min(5.0, max(1.0, scale))
+    if abs(scale - 1.0) < 0.03:
+        return img, 1.0
+
+    return (
+        cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC),
+        scale,
+    )
+
+
+def _ocr_items(img: np.ndarray, *, target_width: int = 1900, psm: int = 11) -> list[OCRItem]:
+    big, scale = _resize_for_ocr(img, target_width=target_width)
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+
+    data = pytesseract.image_to_data(
+        gray,
+        lang=TESSERACT_LANG,
+        config=f"--psm {psm}",
+        output_type=Output.DICT,
+    )
+
+    out: list[OCRItem] = []
+    for i, raw in enumerate(data.get("text", [])):
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = 0.0
+
+        out.append(
+            OCRItem(
+                text=text,
+                conf=conf,
+                box=Box(
+                    float(data["left"][i]) / scale,
+                    float(data["top"][i]) / scale,
+                    float(data["width"][i]) / scale,
+                    float(data["height"][i]) / scale,
                 ),
             )
-            value = _extract_integer(text)
-            if value is not None:
-                candidates.append(value)
-
-    if not candidates:
-        return None
-
-    counts = {}
-    for value in candidates:
-        counts[value] = counts.get(value, 0) + 1
-
-    # Preferuj výsledok, ktorý OCR zopakovalo najčastejšie.
-    return max(counts, key=lambda value: (counts[value], value))
-
-
-
-# ---------------------------------------------------------------------------
-# PRESNEJŠIE OCR PRE OREZANÉ / MENEJ KVALITNÉ REPORTY
-# ---------------------------------------------------------------------------
-
-def _find_red_loss_bbox_cropped(img_bgr: np.ndarray, side: str):
-    """
-    Nájde presný bounding box červeného stratového čísla na ľavej/pravej strane.
-
-    Namiesto OCR veľkého výrezu najprv nájdeme samotné červené číslice.
-    To výrazne pomáha pri malých a komprimovaných screenshotoch.
-    """
-    h, w = img_bgr.shape[:2]
-
-    if side == "left":
-        xa, xb = int(0.10 * w), int(0.32 * w)
-    else:
-        xa, xb = int(0.78 * w), int(0.99 * w)
-
-    ya, yb = int(0.48 * h), int(0.95 * h)
-
-    crop = img_bgr[ya:yb, xa:xb]
-    if crop.size == 0:
-        return None
-
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-
-    mask = (
-        cv2.inRange(
-            hsv,
-            np.array([0, 70, 70]),
-            np.array([15, 255, 255]),
         )
-        |
-        cv2.inRange(
-            hsv,
-            np.array([165, 70, 70]),
-            np.array([180, 255, 255]),
-        )
-    )
+    return out
 
-    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
-    )
 
-    components = []
+def _find_role_anchors(items: Iterable[OCRItem]) -> list[RoleAnchor]:
+    anchors: list[RoleAnchor] = []
+    for item in items:
+        for role in ("attacker", "defender"):
+            sim = _role_similarity(item.text, role)
+            if sim < 0.58:
+                continue
 
-    for i in range(1, count):
-        x, y, cw, ch, area = stats[i]
+            # OCR confidence contributes only a little; text similarity matters more.
+            score = sim + max(0.0, min(100.0, item.conf)) / 500.0
+            anchors.append(RoleAnchor(role=role, score=score, item=item))
+    return anchors
 
-        # Číslice majú určitú minimálnu výšku.
-        # Týmto odfiltrujeme tenké červené čiary a malé grafické artefakty.
-        min_h = max(4, int(0.04 * h))
-        max_h = max(min_h + 1, int(0.16 * h))
 
-        if (
-            ch >= min_h
-            and ch <= max_h
-            and area >= 8
-        ):
-            components.append(
-                (x + xa, y + ya, cw, ch, area)
+def _recover_role_anchors_from_band(
+    img: np.ndarray,
+    known: RoleAnchor,
+) -> list[RoleAnchor]:
+    """
+    Fallback: OCR only a thin horizontal band around a known role header.
+    This often recovers the opposite role on tiny/blurred screenshots without
+    searching the whole screen again.
+    """
+    h, w = img.shape[:2]
+    b = known.item.box
+    y0 = max(0, int(b.y - 1.8 * max(8.0, b.h)))
+    y1 = min(h, int(b.y + 3.0 * max(8.0, b.h)))
+    if y1 <= y0:
+        return []
+
+    band = img[y0:y1, :]
+    items = _ocr_items(band, target_width=max(1900, int(w * 2.5)), psm=6)
+
+    shifted: list[OCRItem] = []
+    for item in items:
+        shifted.append(
+            OCRItem(
+                text=item.text,
+                conf=item.conf,
+                box=Box(item.box.x, item.box.y + y0, item.box.w, item.box.h),
             )
-
-    if not components:
-        return None
-
-    # Zoskupíme jednotlivé číslice, ktoré ležia na rovnakom riadku.
-    groups = []
-
-    for comp in sorted(
-        components,
-        key=lambda c: c[1] + c[3] / 2
-    ):
-        cy = comp[1] + comp[3] / 2
-        found = False
-
-        for group in groups:
-            if abs(cy - group["cy"]) <= 0.04 * h:
-                group["items"].append(comp)
-                group["cy"] = sum(
-                    c[1] + c[3] / 2
-                    for c in group["items"]
-                ) / len(group["items"])
-                found = True
-                break
-
-        if not found:
-            groups.append({
-                "cy": cy,
-                "items": [comp],
-            })
-
-    usable = []
-
-    for group in groups:
-        xs = [c[0] for c in group["items"]]
-        ys = [c[1] for c in group["items"]]
-        x2s = [c[0] + c[2] for c in group["items"]]
-        y2s = [c[1] + c[3] for c in group["items"]]
-
-        box = (
-            min(xs),
-            min(ys),
-            max(x2s) - min(xs),
-            max(y2s) - min(ys),
         )
-
-        total_area = sum(c[4] for c in group["items"])
-
-        # Straty bývajú v spodnej časti panelu.
-        # Kombinujeme veľkosť textu a jeho vertikálnu pozíciu.
-        score = total_area + 0.5 * group["cy"]
-
-        usable.append((score, box))
-
-    if not usable:
-        return None
-
-    return max(usable, key=lambda item: item[0])[1]
+    return _find_role_anchors(shifted)
 
 
-def _ocr_precise_number_box(img_bgr: np.ndarray, box):
-    """
-    OCR čísla z už presne nájdeného bounding boxu.
+# ---------------------------------------------------------------------------
+# Panel-value extraction
+# ---------------------------------------------------------------------------
 
-    Skúša viac mierok, thresholdov a PSM režimov.
-    Výsledok vyberie hlasovaním.
-    """
-    x, y, w, h = [int(v) for v in box]
-    img_h, img_w = img_bgr.shape[:2]
 
-    pad_x = max(5, int(0.25 * w))
-    pad_y = max(3, int(0.25 * h))
-
-    x0 = max(0, x - pad_x)
-    y0 = max(0, y - pad_y)
-    x1 = min(img_w, x + w + pad_x)
-    y1 = min(img_h, y + h + pad_y)
-
-    crop = img_bgr[y0:y1, x0:x1]
-
+def _red_pixel_count(crop: np.ndarray) -> int:
     if crop.size == 0:
-        return None
+        return 0
+    b, g, r = cv2.split(crop.astype(np.int16))
+    mask = (r >= 100) & ((r - g) >= 28) & ((r - b) >= 22)
+    return int(np.count_nonzero(mask))
 
-    candidates = []
 
-    for scale in (4, 6, 8):
-        big = cv2.resize(
-            crop,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC,
-        )
+def _read_loss_below(img: np.ndarray, total_box: Box, total: int) -> tuple[Optional[int], float]:
+    """
+    Read the red loss number immediately below a candidate total.
 
-        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+    The important safety property is that a total is accepted only when a
+    plausible red numeric line exists directly underneath it.
+    """
+    if total <= 0:
+        return None, 0.0
 
-        otsu = cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-        )[1]
+    x, y, bw, bh = total_box.x, total_box.y, total_box.w, total_box.h
+    H, W = img.shape[:2]
+    bh = max(5.0, bh)
+    bw = max(12.0, bw)
 
-        for processed in (gray, otsu):
-            for psm in (7, 8, 13):
-                text = pytesseract.image_to_string(
-                    processed,
-                    config=(
-                        f"--psm {psm} "
-                        "-c tessedit_char_whitelist=0123456789-"
-                    ),
-                )
+    votes: dict[int, float] = {}
 
-                digits = re.sub(r"[^0-9]", "", text)
-
-                if digits:
-                    try:
-                        candidates.append(int(digits))
-                    except ValueError:
-                        pass
-
-    if not candidates:
-        return None
-
-    counts = {}
-
-    for value in candidates:
-        counts[value] = counts.get(value, 0) + 1
-
-    # Najprv počet hlasov. Pri zhode preferujeme kratšie číslo,
-    # aby jeden OCR artefakt nepridal náhodnú číslicu na začiatok.
-    return max(
-        counts,
-        key=lambda value: (
-            counts[value],
-            -len(str(value)),
-        ),
+    # Slightly different windows help with different UI scales and OCR boxes.
+    windows = (
+        (0.35, 1.05, 3.60, 1.45),
+        (0.20, 0.95, 3.35, 1.35),
+        (0.50, 1.15, 3.85, 1.60),
     )
 
-
-def _ocr_total_above_loss(img_bgr: np.ndarray, loss_box, defender_loss=None):
-    """
-    Prečíta celkový počet vojska z riadku priamo NAD stratami.
-
-    Skúšame niekoľko úzkych vertikálnych posunov. Ak poznáme defender_loss,
-    preferujeme hodnotu >= strata a pri viacerých výsledkoch tú, na ktorej
-    sa OCR zhodne najčastejšie.
-    """
-    x, y, w, h = [int(v) for v in loss_box]
-    img_h, img_w = img_bgr.shape[:2]
-
-    # Celkový počet je v rovnakom stĺpci ako strata, približne o 1 riadok vyššie.
-    rects = [
-        (
-            max(0, x - int(0.45 * w)),
-            max(0, y - int(2.10 * h)),
-            min(img_w, x + w + int(0.45 * w)),
-            max(0, y - int(0.35 * h)),
-        ),
-        (
-            max(0, x - int(0.35 * w)),
-            max(0, y - int(1.90 * h)),
-            min(img_w, x + w + int(0.35 * w)),
-            max(0, y - int(0.55 * h)),
-        ),
-        (
-            max(0, x - int(0.55 * w)),
-            max(0, y - int(2.30 * h)),
-            min(img_w, x + w + int(0.55 * w)),
-            max(0, y - int(0.45 * h)),
-        ),
-    ]
-
-    candidates = []
-
-    for x0, y0, x1, y1 in rects:
-        if x1 <= x0 or y1 <= y0:
-            continue
-
-        crop = img_bgr[y0:y1, x0:x1]
+    for left_pad, top_mul, bottom_mul, right_mul in windows:
+        x0 = max(0, int(x - left_pad * bw))
+        x1 = min(W, int(x + right_mul * bw))
+        y0 = max(0, int(y + top_mul * bh))
+        y1 = min(H, int(y + bottom_mul * bh))
+        crop = img[y0:y1, x0:x1]
         if crop.size == 0:
             continue
 
-        for scale in (4, 6, 8):
-            big = cv2.resize(
-                crop,
-                None,
-                fx=scale,
-                fy=scale,
-                interpolation=cv2.INTER_CUBIC,
-            )
-
-            gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
-            otsu = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )[1]
-
-            for processed in (gray, otsu):
-                for psm in (7, 8, 13):
-                    text = pytesseract.image_to_string(
-                        processed,
-                        config=(
-                            f"--psm {psm} "
-                            "-c tessedit_char_whitelist=0123456789 "
-                        ),
-                    )
-
-                    value = _extract_integer(text)
-                    if value is not None:
-                        candidates.append(value)
-
-    if not candidates:
-        return None
-
-    counts = {}
-    for value in candidates:
-        counts[value] = counts.get(value, 0) + 1
-
-    if defender_loss is not None:
-        valid = [v for v in counts if v >= defender_loss]
-        if valid:
-            # Pri rovnakej zhode preferuj číslo, ktoré nie je presne strata,
-            # pretože to často znamená, že OCR omylom čítalo spodný riadok.
-            return max(
-                valid,
-                key=lambda v: (
-                    counts[v],
-                    1 if v > defender_loss else 0,
-                    -len(str(v)),
-                ),
-            )
-
-    return max(
-        counts,
-        key=lambda v: (counts[v], -len(str(v))),
-    )
-
-
-def _analyze_cropped_report_precise(img_bgr: np.ndarray):
-    """
-    Presná analýza širokého orezaného reportu.
-
-    1. OCR nadpisov určí, kde je Obranca / Defender.
-    2. Červenou maskou nájdeme presnú polohu oboch stratových čísel.
-    3. Každé číslo čítame niekoľkokrát a výsledky hlasujú.
-    4. Počet obrancov čítame priamo nad jeho stratovým číslom.
-    """
-    left_label = _ocr_label(
-        img_bgr,
-        (0.00, 0.00, 0.35, 0.27),
-    )
-
-    right_label = _ocr_label(
-        img_bgr,
-        (0.65, 0.00, 1.00, 0.27),
-    )
-
-    left_def = _defender_score(left_label)
-    right_def = _defender_score(right_label)
-    left_att = _attacker_score(left_label)
-    right_att = _attacker_score(right_label)
-
-    # Vyberieme orientáciu, ktorá najlepšie sedí na OBE hlavičky:
-    # Obranca/Defender na jednej strane a Útočník/Attacker na druhej.
-    left_is_defender_score = left_def + right_att
-    right_is_defender_score = right_def + left_att
-
-    if max(left_is_defender_score, right_is_defender_score) < 0.80:
-        return None
-
-    left_loss_box = _find_red_loss_bbox_cropped(
-        img_bgr, "left"
-    )
-
-    right_loss_box = _find_red_loss_bbox_cropped(
-        img_bgr, "right"
-    )
-
-    if left_loss_box is None or right_loss_box is None:
-        return None
-
-    left_loss = _ocr_precise_number_box(
-        img_bgr,
-        left_loss_box,
-    )
-
-    right_loss = _ocr_precise_number_box(
-        img_bgr,
-        right_loss_box,
-    )
-
-    if left_loss is None or right_loss is None:
-        return None
-
-    if left_is_defender_score > right_is_defender_score:
-        defender_loss = left_loss
-        attacker_loss = right_loss
-        defender_total = _ocr_total_above_loss(
-            img_bgr,
-            left_loss_box,
-            defender_loss,
-        )
-    else:
-        defender_loss = right_loss
-        attacker_loss = left_loss
-        defender_total = _ocr_total_above_loss(
-            img_bgr,
-            right_loss_box,
-            defender_loss,
-        )
-
-    if defender_total is None or defender_total <= 0:
-        return None
-
-    # Logická kontrola: nemôže zomrieť viac obrancov,
-    # než ich bolo pred bitkou.
-    if defender_loss > defender_total:
-        return None
-
-    return attacker_loss, defender_loss, defender_total
-
-
-
-
-# ---------------------------------------------------------------------------
-# OCR V3: presná detekcia dvoch číselných riadkov
-# ---------------------------------------------------------------------------
-
-def _find_loss_box_v3(img_bgr: np.ndarray, side: str):
-    """
-    Nájde spodný červený číselný riadok v ľavom alebo pravom paneli.
-    Hľadáme iba v úzkom stĺpci, kde sú čísla, takže ignorujeme erby/ikony.
-    """
-    h, w = img_bgr.shape[:2]
-
-    if side == "left":
-        xa, xb = int(0.14 * w), int(0.31 * w)
-    else:
-        xa, xb = int(0.80 * w), int(0.99 * w)
-
-    ya, yb = int(0.28 * h), int(0.90 * h)
-    crop = img_bgr[ya:yb, xa:xb]
-
-    if crop.size == 0:
-        return None
-
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-
-    mask = (
-        cv2.inRange(hsv, np.array([0, 70, 70]), np.array([15, 255, 255]))
-        |
-        cv2.inRange(hsv, np.array([165, 70, 70]), np.array([180, 255, 255]))
-    )
-
-    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
-    )
-
-    components = []
-
-    for i in range(1, count):
-        x, y, cw, ch, area = stats[i]
-
-        min_h = max(3, int(0.03 * h))
-        max_h = max(min_h + 1, int(0.14 * h))
-
-        if (
-            min_h <= ch <= max_h
-            and area >= 5
-        ):
-            components.append((x + xa, y + ya, cw, ch, area))
-
-    if not components:
-        return None
-
-    groups = []
-
-    for comp in sorted(components, key=lambda c: c[1] + c[3] / 2):
-        cy = comp[1] + comp[3] / 2
-
-        for group in groups:
-            if abs(cy - group["cy"]) <= 0.03 * h:
-                group["items"].append(comp)
-                group["cy"] = sum(
-                    c[1] + c[3] / 2 for c in group["items"]
-                ) / len(group["items"])
-                break
-        else:
-            groups.append({"cy": cy, "items": [comp]})
-
-    candidates = []
-
-    for group in groups:
-        # Reálne číslo má zvyčajne viac oddelených červených komponentov.
-        if len(group["items"]) < 2:
+        red_count = _red_pixel_count(crop)
+        if red_count < max(4, int(crop.shape[0] * crop.shape[1] * 0.002)):
             continue
 
-        xs = [c[0] for c in group["items"]]
-        ys = [c[1] for c in group["items"]]
-        x2s = [c[0] + c[2] for c in group["items"]]
-        y2s = [c[1] + c[3] for c in group["items"]]
-
-        box = (
-            min(xs),
-            min(ys),
-            max(x2s) - min(xs),
-            max(y2s) - min(ys),
+        # Green channel suppresses red UI text background surprisingly well;
+        # grayscale remains useful for anti-aliased digits. Use both, but only
+        # on this tiny crop.
+        sources = (
+            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
+            crop[:, :, 1],
         )
 
-        candidates.append((group["cy"], box))
-
-    if not candidates:
-        return None
-
-    # Straty sú spodný z dvoch číselných riadkov.
-    return max(candidates, key=lambda item: item[0])[1]
-
-
-def _ocr_candidates_v3(img_bgr: np.ndarray, box):
-    """
-    Vráti OCR kandidátov a počet hlasov pre stratové číslo.
-    """
-    x, y, w, h = [int(v) for v in box]
-    img_h, img_w = img_bgr.shape[:2]
-
-    pad_x = max(2, int(0.10 * w))
-    pad_y = max(2, int(0.20 * h))
-
-    crop = img_bgr[
-        max(0, y - pad_y):min(img_h, y + h + pad_y),
-        max(0, x - pad_x):min(img_w, x + w + pad_x),
-    ]
-
-    if crop.size == 0:
-        return {}
-
-    values = []
-
-    for scale in (4, 6, 8):
-        big = cv2.resize(
-            crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
-        )
-
-        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
-        otsu = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )[1]
-
-        b, g, r = cv2.split(big)
-        strongest_other = np.maximum(g, b).astype(np.int16)
-        red_only = np.where(
-            (r.astype(np.int16) > 110)
-            & ((r.astype(np.int16) - strongest_other) > 25),
-            0,
-            255,
-        ).astype(np.uint8)
-
-        for processed in (gray, otsu, red_only):
-            for psm in (7, 8, 13):
-                text = pytesseract.image_to_string(
-                    processed,
-                    config=(
-                        f"--psm {psm} "
-                        "-c tessedit_char_whitelist=0123456789-"
-                    ),
-                )
-
-                digits = re.sub(r"[^0-9]", "", text)
-
-                if digits:
-                    try:
-                        values.append(int(digits))
-                    except ValueError:
-                        pass
-
-    counts = {}
-
-    for value in values:
-        counts[value] = counts.get(value, 0) + 1
-
-    return counts
-
-
-def _ocr_total_v3(img_bgr: np.ndarray, loss_box):
-    """
-    Prečíta horné číslo (počet vojska pred stratami) presne nad loss riadkom.
-    """
-    x, y, w, h = [int(v) for v in loss_box]
-    img_h, img_w = img_bgr.shape[:2]
-
-    values = []
-
-    # Niektoré screenshoty majú pár pixelov navyše dole,
-    # preto skúšame viac tesných vertikálnych posunov.
-    windows = (
-        (2.0, 0.35),
-        (2.3, 0.55),
-        (1.9, 0.45),
-        (2.5, 0.70),
-    )
-
-    for top_mul, bottom_mul in windows:
-        x0 = max(0, x - int(0.40 * w))
-        x1 = min(img_w, x + w + int(0.40 * w))
-        y0 = max(0, y - int(top_mul * h))
-        y1 = max(0, y - int(bottom_mul * h))
-
-        if x1 <= x0 or y1 <= y0:
-            continue
-
-        crop = img_bgr[y0:y1, x0:x1]
-
-        for scale in (4, 6, 8):
-            big = cv2.resize(
-                crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
-            )
-
-            gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
-            otsu = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )[1]
-
-            for processed in (gray, otsu):
-                for psm in (7, 8, 13):
-                    text = pytesseract.image_to_string(
-                        processed,
-                        config=(
-                            f"--psm {psm} "
-                            "-c tessedit_char_whitelist=0123456789 "
-                        ),
-                    )
-
-                    digits = re.sub(r"[^0-9]", "", text)
-
-                    if digits:
-                        try:
-                            values.append(int(digits))
-                        except ValueError:
-                            pass
-
-    if not values:
-        return None
-
-    counts = {}
-
-    for value in values:
-        counts[value] = counts.get(value, 0) + 1
-
-    return max(counts, key=lambda v: (counts[v], -len(str(v))))
-
-
-def _choose_loss_v3(counts, total):
-    """
-    Vyberie najpravdepodobnejšiu stratu.
-    Kľúčová kontrola: strata nikdy nemôže byť väčšia než počet vojska.
-    """
-    if not counts:
-        return None
-
-    valid = [
-        value for value in counts
-        if value > 0 and (total is None or value <= total)
-    ]
-
-    if not valid:
-        return None
-
-    return max(
-        valid,
-        key=lambda value: (
-            counts[value],
-            -len(str(value)),
-        ),
-    )
-
-
-def _analyze_cropped_report_v3(img_bgr: np.ndarray):
-    """
-    Robustnejší režim pre široké orezané reporty.
-    """
-    left_label = _ocr_label(img_bgr, (0.00, 0.00, 0.35, 0.27))
-    right_label = _ocr_label(img_bgr, (0.65, 0.00, 1.00, 0.27))
-
-    left_def = _defender_score(left_label)
-    right_def = _defender_score(right_label)
-    left_att = _attacker_score(left_label)
-    right_att = _attacker_score(right_label)
-
-    left_is_defender_score = left_def + right_att
-    right_is_defender_score = right_def + left_att
-
-    if max(left_is_defender_score, right_is_defender_score) < 0.80:
-        return None
-
-    left_box = _find_loss_box_v3(img_bgr, "left")
-    right_box = _find_loss_box_v3(img_bgr, "right")
-
-    if left_box is None or right_box is None:
-        return None
-
-    # Najprv čítame CELKOVÉ počty.
-    left_total = _ocr_total_v3(img_bgr, left_box)
-    right_total = _ocr_total_v3(img_bgr, right_box)
-
-    # Potom loss OCR kandidátov a odfiltrujeme nemožné hodnoty.
-    left_loss = _choose_loss_v3(
-        _ocr_candidates_v3(img_bgr, left_box),
-        left_total,
-    )
-    right_loss = _choose_loss_v3(
-        _ocr_candidates_v3(img_bgr, right_box),
-        right_total,
-    )
-
-    if (
-        left_loss is None
-        or right_loss is None
-        or left_total is None
-        or right_total is None
-    ):
-        return None
-
-    if left_is_defender_score > right_is_defender_score:
-        defender_loss = left_loss
-        defender_total = left_total
-        attacker_loss = right_loss
-    else:
-        defender_loss = right_loss
-        defender_total = right_total
-        attacker_loss = left_loss
-
-    if defender_total <= 0 or defender_loss > defender_total:
-        return None
-
-    return attacker_loss, defender_loss, defender_total
-
-
-
-
-# ---------------------------------------------------------------------------
-# OCR V4 HARD MODE: segmentácia číslic po znakoch
-# ---------------------------------------------------------------------------
-
-def _segment_red_digits(img_bgr: np.ndarray, box):
-    """
-    Z presného loss boxu vytiahne jednotlivé červené číslice zľava doprava.
-    Mínus ignorujeme, pretože strata je už známy typ poľa.
-    """
-    x, y, w, h = [int(v) for v in box]
-    H, W = img_bgr.shape[:2]
-
-    pad_x = max(2, int(0.08 * w))
-    pad_y = max(2, int(0.18 * h))
-
-    x0 = max(0, x - pad_x)
-    y0 = max(0, y - pad_y)
-    x1 = min(W, x + w + pad_x)
-    y1 = min(H, y + h + pad_y)
-
-    crop = img_bgr[y0:y1, x0:x1]
-    if crop.size == 0:
-        return []
-
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-
-    mask = (
-        cv2.inRange(hsv, np.array([0, 65, 65]), np.array([18, 255, 255]))
-        |
-        cv2.inRange(hsv, np.array([162, 65, 65]), np.array([180, 255, 255]))
-    )
-
-    # Jemné spojenie rozbitých častí jednej číslice.
-    kernel = np.ones((2, 2), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-
-    comps = []
-    crop_h, crop_w = mask.shape[:2]
-
-    for i in range(1, count):
-        cx, cy, cw, ch, area = stats[i]
-
-        # Odfiltrujeme mínus, bodky a šum.
-        if ch < max(4, int(crop_h * 0.28)):
-            continue
-        if cw < 1 or area < 5:
-            continue
-        if cw > crop_w * 0.35:
-            continue
-
-        comps.append((cx, cy, cw, ch, area))
-
-    if not comps:
-        return []
-
-    comps.sort(key=lambda c: c[0])
-
-    # Zlepíme komponenty, ktoré patria tej istej číslici
-    # (napr. rozbitá 8 alebo 4).
-    merged = []
-
-    for comp in comps:
-        cx, cy, cw, ch, area = comp
-
-        if not merged:
-            merged.append([cx, cy, cw, ch, area])
-            continue
-
-        px, py, pw, ph, parea = merged[-1]
-        gap = cx - (px + pw)
-
-        vertical_overlap = max(
-            0,
-            min(cy + ch, py + ph) - max(cy, py)
-        )
-
-        overlap_ratio = vertical_overlap / max(1, min(ch, ph))
-
-        if gap <= max(1, int(0.10 * max(ch, ph))) and overlap_ratio > 0.45:
-            nx0 = min(px, cx)
-            ny0 = min(py, cy)
-            nx1 = max(px + pw, cx + cw)
-            ny1 = max(py + ph, cy + ch)
-
-            merged[-1] = [
-                nx0,
-                ny0,
-                nx1 - nx0,
-                ny1 - ny0,
-                parea + area,
-            ]
-        else:
-            merged.append([cx, cy, cw, ch, area])
-
-    return [(x0, y0, crop, tuple(m)) for m in merged]
-
-
-def _ocr_single_digit(digit_img: np.ndarray):
-    """
-    Prečíta JEDNU číslicu cez Tesseract v single-character režime.
-    Vracia (digit, confidence_score_votes) alebo None.
-    """
-    if digit_img is None or digit_img.size == 0:
-        return None
-
-    votes = {}
-
-    for scale in (8, 12, 16):
-        big = cv2.resize(
-            digit_img,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC,
-        )
-
-        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
-
-        variants = [
-            gray,
-            cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )[1],
-            cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-            )[1],
-        ]
-
-        for processed in variants:
-            text = pytesseract.image_to_string(
-                processed,
-                config=(
-                    "--psm 10 "
-                    "-c tessedit_char_whitelist=0123456789"
-                ),
-            )
-
-            digits = re.sub(r"[^0-9]", "", text)
-
-            if len(digits) == 1:
-                d = digits[0]
-                votes[d] = votes.get(d, 0) + 1
+        for source in sources:
+            big = cv2.resize(source, None, fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
+            for psm in (7, 13):
+                txt = pytesseract.image_to_string(
+                    big,
+                    lang=TESSERACT_LANG,
+                    config=f"--psm {psm} -c tessedit_char_whitelist=0123456789- ,.",
+                ).strip()
+                val = _parse_int(txt)
+                if val is None or val < 0 or val > total:
+                    continue
+                if val == 0 and total > 0:
+                    # A literal 0 loss is possible, but red zero is uncommon and
+                    # OCR false-zero is common. Main OCR can still handle it.
+                    weight = 0.4
+                else:
+                    weight = 1.0
+                votes[val] = votes.get(val, 0.0) + weight
 
     if not votes:
-        return None
+        return None, 0.0
 
-    digit = max(votes, key=votes.get)
-    return digit, votes[digit]
+    ranked = sorted(votes.items(), key=lambda kv: kv[1], reverse=True)
+    best_val, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
 
+    # Require repeated agreement, and reject ambiguous local OCR.
+    if best_score < 2.0:
+        return None, 0.0
+    if second_score > 0 and (best_score - second_score) < 0.8:
+        return None, 0.0
 
-def _ocr_loss_char_by_char(img_bgr: np.ndarray, box):
-    """
-    Hlavný HARD MODE OCR:
-    červené číslo rozseká na jednotlivé číslice a každú číta samostatne.
-    """
-    segmented = _segment_red_digits(img_bgr, box)
-
-    if not segmented:
-        return None
-
-    chars = []
-    confidences = []
-
-    for _, _, crop, comp in segmented:
-        cx, cy, cw, ch, _ = comp
-
-        # Výrez jednej číslice s malým paddingom.
-        px = max(1, int(0.16 * cw))
-        py = max(1, int(0.12 * ch))
-
-        x0 = max(0, cx - px)
-        y0 = max(0, cy - py)
-        x1 = min(crop.shape[1], cx + cw + px)
-        y1 = min(crop.shape[0], cy + ch + py)
-
-        digit_crop = crop[y0:y1, x0:x1]
-
-        result = _ocr_single_digit(digit_crop)
-
-        if result is None:
-            return None
-
-        digit, conf = result
-        chars.append(digit)
-        confidences.append(conf)
-
-    if not chars:
-        return None
-
-    # Ochrana proti náhodnému OCR šumu.
-    if sum(confidences) < len(confidences):
-        return None
-
-    try:
-        return int("".join(chars))
-    except ValueError:
-        return None
+    confidence = min(1.0, 0.45 + 0.12 * best_score)
+    return best_val, confidence
 
 
-def _ocr_loss_consensus_v4(img_bgr: np.ndarray, box, total=None):
-    """
-    Kombinuje:
-    1. OCR celého čísla,
-    2. OCR po jednotlivých čísliciach.
+def _numeric_groups(items: Iterable[OCRItem], *, panel_h: int) -> list[tuple[int, Box, float, bool]]:
+    """Group split OCR tokens such as `12` + `205` into one numeric row."""
+    numeric: list[OCRItem] = []
+    for item in items:
+        if _parse_int(item.text) is None:
+            continue
+        # Avoid accepting words containing a stray digit.
+        if not re.fullmatch(r"[\s\-+0-9.,:]+", item.text):
+            continue
+        numeric.append(item)
 
-    HARD MODE dá prednosť znakovej segmentácii, ak dá logický výsledok.
-    """
-    char_value = _ocr_loss_char_by_char(img_bgr, box)
+    groups: list[list[OCRItem]] = []
+    tolerance = max(4.0, panel_h * 0.025)
 
-    if (
-        char_value is not None
-        and char_value > 0
-        and (total is None or char_value <= total)
-    ):
-        return char_value
+    for item in sorted(numeric, key=lambda i: i.box.cy):
+        placed = False
+        for group in groups:
+            group_cy = sum(g.box.cy for g in group) / len(group)
+            if abs(item.box.cy - group_cy) <= tolerance:
+                group.append(item)
+                placed = True
+                break
+        if not placed:
+            groups.append([item])
 
-    # Fallback na hlasovanie celého čísla.
-    counts = _ocr_candidates_v3(img_bgr, box)
-    return _choose_loss_v3(counts, total)
-
-
-def _analyze_cropped_report_v4(img_bgr: np.ndarray):
-    """
-    Najtvrdší režim pre široké orezané reporty:
-    - roly určí z Obranca/Defender a Útočník/Attacker,
-    - nájde červený loss riadok,
-    - loss číta po JEDNOTLIVÝCH čísliciach,
-    - total číta samostatne nad loss riadkom,
-    - kontroluje matematickú konzistenciu.
-    """
-    left_label = _ocr_label(img_bgr, (0.00, 0.00, 0.35, 0.27))
-    right_label = _ocr_label(img_bgr, (0.65, 0.00, 1.00, 0.27))
-
-    left_def = _defender_score(left_label)
-    right_def = _defender_score(right_label)
-    left_att = _attacker_score(left_label)
-    right_att = _attacker_score(right_label)
-
-    left_is_defender_score = left_def + right_att
-    right_is_defender_score = right_def + left_att
-
-    if max(left_is_defender_score, right_is_defender_score) < 0.80:
-        return None
-
-    left_box = _find_loss_box_v3(img_bgr, "left")
-    right_box = _find_loss_box_v3(img_bgr, "right")
-
-    if left_box is None or right_box is None:
-        return None
-
-    left_total = _ocr_total_v3(img_bgr, left_box)
-    right_total = _ocr_total_v3(img_bgr, right_box)
-
-    left_loss = _ocr_loss_consensus_v4(
-        img_bgr,
-        left_box,
-        left_total,
-    )
-
-    right_loss = _ocr_loss_consensus_v4(
-        img_bgr,
-        right_box,
-        right_total,
-    )
-
-    if (
-        left_loss is None
-        or right_loss is None
-        or left_total is None
-        or right_total is None
-    ):
-        return None
-
-    if left_is_defender_score > right_is_defender_score:
-        defender_loss = left_loss
-        defender_total = left_total
-        attacker_loss = right_loss
-    else:
-        defender_loss = right_loss
-        defender_total = right_total
-        attacker_loss = left_loss
-
-    if defender_total <= 0:
-        return None
-
-    if defender_loss > defender_total:
-        return None
-
-    return attacker_loss, defender_loss, defender_total
-
-
-
-# ---------------------------------------------------------------------------
-# LAYOUTY BATTLE REPORTU
-# ---------------------------------------------------------------------------
-
-def _get_layouts(img_bgr: np.ndarray):
-    """
-    Vráti dvojice panelov. Každý panel má:
-    label = Obranca/Defender alebo Útočník/Attacker
-    total = počet vojska pred stratou
-    loss  = počet strateného vojska
-    """
-    h, w = img_bgr.shape[:2]
-    aspect = w / max(1, h)
-
-    if aspect >= 2.5:
-        # OREZANÝ battle report
-        return [
-            [
-                {
-                    "label": (0.00, 0.00, 0.31, 0.25),
-                    "total": (0.13, 0.52, 0.31, 0.75),
-                    "loss":  (0.13, 0.69, 0.31, 0.94),
-                },
-                {
-                    "label": (0.69, 0.00, 1.00, 0.25),
-                    "total": (0.82, 0.52, 0.995, 0.75),
-                    "loss":  (0.82, 0.69, 0.995, 0.94),
-                },
-            ],
-            # Širší fallback pre trochu inak orezané reporty
-            [
-                {
-                    "label": (0.00, 0.00, 0.40, 0.30),
-                    "total": (0.10, 0.46, 0.39, 0.76),
-                    "loss":  (0.10, 0.67, 0.39, 1.00),
-                },
-                {
-                    "label": (0.60, 0.00, 1.00, 0.30),
-                    "total": (0.70, 0.46, 1.00, 0.76),
-                    "loss":  (0.70, 0.67, 1.00, 1.00),
-                },
-            ],
-        ]
-
-    # CELÝ SCREENSHOT
-    return [
-        [
-            {
-                "label": (0.015, 0.680, 0.190, 0.718),
-                "total": (0.090, 0.775, 0.185, 0.805),
-                "loss":  (0.090, 0.800, 0.185, 0.835),
-            },
-            {
-                "label": (0.415, 0.680, 0.595, 0.718),
-                "total": (0.500, 0.775, 0.590, 0.805),
-                "loss":  (0.500, 0.800, 0.590, 0.835),
-            },
-        ],
-        # Fallback s mierne väčšími výrezmi
-        [
-            {
-                "label": (0.010, 0.665, 0.205, 0.730),
-                "total": (0.075, 0.760, 0.200, 0.815),
-                "loss":  (0.075, 0.795, 0.200, 0.850),
-            },
-            {
-                "label": (0.405, 0.665, 0.610, 0.730),
-                "total": (0.480, 0.760, 0.605, 0.815),
-                "loss":  (0.480, 0.795, 0.605, 0.850),
-            },
-        ],
-    ]
-
-
-# ---------------------------------------------------------------------------
-# ANALÝZA REPORTU
-# ---------------------------------------------------------------------------
-
-def analyze_battle_report(image_bytes: bytes):
-    """
-    Vráti:
-        (attacker_loss, defender_loss, defender_total)
-
-    Pri širokých orezaných reportoch používa presnejšiu detekciu
-    samotných červených číslic. Pri celých screenshotoch ostáva
-    pôvodný layoutový fallback.
-    """
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
-    if img is None:
-        return None
-
-    h, w = img.shape[:2]
-    aspect = w / max(1, h)
-
-    # V4 HARD MODE pre orezané battle reporty:
-    # loss čísla sa OCR čítajú po jednotlivých čísliciach.
-    if aspect >= 2.5:
-        precise = _analyze_cropped_report_v4(img)
-
-        if precise is not None:
-            return precise
-
-    # Fallback pre celé screenshoty alebo atypický orez.
-    for panels in _get_layouts(img):
-        left, right = panels
-
-        left_label = _ocr_label(img, left["label"])
-        right_label = _ocr_label(img, right["label"])
-
-        left_def = _defender_score(left_label)
-        right_def = _defender_score(right_label)
-        left_att = _attacker_score(left_label)
-        right_att = _attacker_score(right_label)
-
-        left_is_defender_score = left_def + right_att
-        right_is_defender_score = right_def + left_att
-
-        if max(left_is_defender_score, right_is_defender_score) < 0.80:
+    parsed: list[tuple[int, Box, float, bool]] = []
+    for group in groups:
+        group = sorted(group, key=lambda i: i.box.x)
+        text = "".join(g.text for g in group)
+        val = _parse_int(text)
+        if val is None:
             continue
 
-        if left_is_defender_score > right_is_defender_score:
-            defender_panel = left
-            attacker_panel = right
+        x0 = min(g.box.x for g in group)
+        y0 = min(g.box.y for g in group)
+        x1 = max(g.box.x + g.box.w for g in group)
+        y1 = max(g.box.y + g.box.h for g in group)
+        confs = [max(0.0, min(100.0, g.conf)) for g in group]
+        avg_conf = sum(confs) / max(1, len(confs))
+        has_minus = any("-" in g.text for g in group)
+        parsed.append((val, Box(x0, y0, x1 - x0, y1 - y0), avg_conf, has_minus))
+
+    return sorted(parsed, key=lambda row: row[1].cy)
+
+
+def _read_panel_values(
+    img: np.ndarray,
+    role_anchor: RoleAnchor,
+    panel_half_width: float,
+) -> Optional[PanelValues]:
+    H, W = img.shape[:2]
+    role = role_anchor.item.box
+
+    # Crop only the validated side-panel neighbourhood. Unlike fixed screen
+    # coordinates, this follows the detected role header and therefore works
+    # on full screenshots, crops and either left/right role order.
+    x0 = max(0, int(role.cx - panel_half_width))
+    x1 = min(W, int(role.cx + panel_half_width))
+    y0 = max(0, int(role.y - max(3.0, 0.3 * role.h)))
+    y1 = H
+    panel = img[y0:y1, x0:x1]
+    if panel.size == 0:
+        return None
+
+    ph, pw = panel.shape[:2]
+    items = _ocr_items(panel, target_width=900, psm=11)
+
+    # Numeric total/loss column is on the right half of each player panel in
+    # the GGE battle-result UI. This is relative to the detected role header,
+    # not to the screenshot edges.
+    role_cx_local = role.cx - x0
+    role_bottom_local = role.y + role.h - y0
+    min_x = role_cx_local - 0.10 * pw
+    max_x = role_cx_local + 0.48 * pw
+    min_y = role_bottom_local + max(2.0, 0.25 * role.h)
+
+    filtered: list[OCRItem] = []
+    for item in items:
+        if item.box.cy < min_y:
+            continue
+        if not (min_x <= item.box.cx <= max_x):
+            continue
+        filtered.append(item)
+
+    groups = _numeric_groups(filtered, panel_h=ph)
+    if not groups:
+        return None
+
+    candidates: list[PanelValues] = []
+
+    for total, local_box, avg_conf, has_minus in groups:
+        if total <= 0 or has_minus:
+            continue
+        if avg_conf < 25.0:
+            continue
+
+        global_box = Box(
+            local_box.x + x0,
+            local_box.y + y0,
+            local_box.w,
+            local_box.h,
+        )
+        loss, loss_conf = _read_loss_below(img, global_box, total)
+        if loss is None:
+            continue
+        if loss > total:
+            continue
+
+        # Better OCR totals + repeated local loss agreement score higher.
+        conf = 0.45 * min(1.0, avg_conf / 90.0) + 0.55 * loss_conf
+        candidates.append(
+            PanelValues(total=total, loss=loss, confidence=conf, total_box=global_box)
+        )
+
+    if not candidates:
+        return None
+
+    # In a valid result panel there should normally be exactly one total with
+    # a red loss row directly below it. If more than one passes, take the most
+    # confident and require a useful margin.
+    candidates.sort(key=lambda c: c.confidence, reverse=True)
+    best = candidates[0]
+    if len(candidates) > 1 and best.confidence - candidates[1].confidence < 0.08:
+        return None
+    return best
+
+
+
+
+def _global_value_candidates(
+    img: np.ndarray,
+    items: Iterable[OCRItem],
+    *,
+    min_y: float,
+) -> list[PanelValues]:
+    """
+    Find total+red-loss pairs without using a role header.
+
+    This is intentionally only a fallback for the *opposite* panel after one
+    Attacker/Defender panel has already been positively identified. The red
+    loss line directly below the total keeps unrelated screen numbers out.
+    """
+    H, _ = img.shape[:2]
+    numeric_items = [i for i in items if i.box.cy >= min_y]
+    groups = _numeric_groups(numeric_items, panel_h=H)
+    out: list[PanelValues] = []
+
+    for total, box, avg_conf, has_minus in groups:
+        if total <= 0 or has_minus or avg_conf < 25.0:
+            continue
+        loss, loss_conf = _read_loss_below(img, box, total)
+        if loss is None or loss > total:
+            continue
+        conf = 0.45 * min(1.0, avg_conf / 90.0) + 0.55 * loss_conf
+        out.append(PanelValues(total=total, loss=loss, confidence=conf, total_box=box))
+
+    return out
+
+
+def _analyze_from_one_role(
+    img: np.ndarray,
+    items: list[OCRItem],
+    anchors: list[RoleAnchor],
+) -> Optional[BattleAnalysis]:
+    """
+    Safe fallback for cases where OCR sees only one of the two role labels.
+
+    We first validate the labelled panel normally. Only then do we accept an
+    unlabelled total/loss pair if it is on the other side and horizontally
+    aligned with the labelled panel's total row. Thus a stray 'Defender' word
+    elsewhere on a full screenshot is not enough to trigger an analysis.
+    """
+    H, W = img.shape[:2]
+    results: list[BattleAnalysis] = []
+
+    # Stronger role matches first; weak fuzzy matches are considered only if
+    # they also validate as a real result panel.
+    for known in sorted(anchors, key=lambda a: a.score, reverse=True)[:6]:
+        # Without a second role header we do not know panel separation yet.
+        # Start with a conservative local panel width derived from the screen.
+        # Try two widths because a crop and a full screenshot have different
+        # amounts of surrounding UI.
+        known_values = None
+        for half in (0.13 * W, 0.18 * W, 0.23 * W):
+            known_values = _read_panel_values(img, known, half)
+            if known_values is not None:
+                break
+        if known_values is None:
+            continue
+
+        other_candidates = _global_value_candidates(
+            img,
+            items,
+            min_y=max(0.0, known.item.box.y + known.item.box.h),
+        )
+
+        scored: list[tuple[float, PanelValues]] = []
+        kb = known_values.total_box
+        for cand in other_candidates:
+            cb = cand.total_box
+
+            # Must be a distinct side panel.
+            dx = abs(cb.cx - kb.cx)
+            if dx < 0.16 * W:
+                continue
+
+            # Totals in the two result panels sit on the same row.
+            y_tol = max(0.055 * H, 4.0 * max(kb.h, cb.h, 5.0))
+            dy = abs(cb.cy - kb.cy)
+            if dy > y_tol:
+                continue
+
+            y_score = max(0.0, 1.0 - dy / y_tol)
+            x_score = min(1.0, dx / max(1.0, 0.35 * W))
+            score = 0.55 * cand.confidence + 0.30 * y_score + 0.15 * x_score
+            scored.append((score, cand))
+
+        if not scored:
+            continue
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, other = scored[0]
+        if len(scored) > 1 and best_score - scored[1][0] < 0.08:
+            # More than one different opposite panel looks equally plausible.
+            continue
+
+        if known.role == "defender":
+            defender = known_values
+            attacker = other
         else:
-            defender_panel = right
-            attacker_panel = left
+            attacker = known_values
+            defender = other
 
-        attacker_loss = _ocr_number_from_roi(
-            img,
-            attacker_panel["loss"],
+        if attacker.loss > attacker.total or defender.loss > defender.total:
+            continue
+
+        role_conf = min(1.0, known.score / 1.10)
+        confidence = (
+            0.24 * role_conf
+            + 0.36 * known_values.confidence
+            + 0.30 * other.confidence
+            + 0.10 * min(1.0, best_score)
         )
 
-        defender_loss = _ocr_number_from_roi(
-            img,
-            defender_panel["loss"],
+        results.append(
+            BattleAnalysis(
+                attacker_total=attacker.total,
+                attacker_loss=attacker.loss,
+                defender_total=defender.total,
+                defender_loss=defender.loss,
+                confidence=confidence,
+            )
         )
 
-        defender_total = _ocr_number_from_roi(
-            img,
-            defender_panel["total"],
-        )
+    if not results:
+        return None
 
+    results.sort(key=lambda r: r.confidence, reverse=True)
+    best = results[0]
+    if best.confidence < 0.62:
+        return None
+    if len(results) > 1 and best.confidence - results[1].confidence < 0.04:
+        r2 = results[1]
         if (
-            attacker_loss is not None
-            and defender_loss is not None
-            and defender_total is not None
-            and defender_total > 0
-            and defender_loss <= defender_total
+            best.attacker_total != r2.attacker_total
+            or best.attacker_loss != r2.attacker_loss
+            or best.defender_total != r2.defender_total
+            or best.defender_loss != r2.defender_loss
         ):
-            return (
-                attacker_loss,
-                defender_loss,
-                defender_total,
+            return None
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Battle-panel pairing
+# ---------------------------------------------------------------------------
+
+
+def _pair_geometry_score(a: RoleAnchor, d: RoleAnchor, W: int, H: int) -> Optional[float]:
+    ab = a.item.box
+    db = d.item.box
+    sep = abs(ab.cx - db.cx)
+    if sep < 0.14 * W or sep > 0.82 * W:
+        return None
+
+    ydiff = abs(ab.cy - db.cy)
+    allowed_y = max(0.07 * H, 4.5 * max(ab.h, db.h, 5.0))
+    if ydiff > allowed_y:
+        return None
+
+    y_score = max(0.0, 1.0 - ydiff / allowed_y)
+    sep_score = min(1.0, sep / max(1.0, 0.35 * W))
+    return 0.55 * y_score + 0.45 * sep_score
+
+
+def _analyze_with_anchors(img: np.ndarray, anchors: list[RoleAnchor]) -> Optional[BattleAnalysis]:
+    H, W = img.shape[:2]
+    attackers = [a for a in anchors if a.role == "attacker"]
+    defenders = [a for a in anchors if a.role == "defender"]
+
+    results: list[BattleAnalysis] = []
+
+    for attacker in attackers:
+        for defender in defenders:
+            geo = _pair_geometry_score(attacker, defender, W, H)
+            if geo is None:
+                continue
+
+            sep = abs(attacker.item.box.cx - defender.item.box.cx)
+            panel_half = min(0.24 * W, max(0.10 * W, 0.33 * sep))
+
+            av = _read_panel_values(img, attacker, panel_half)
+            if av is None:
+                continue
+            dv = _read_panel_values(img, defender, panel_half)
+            if dv is None:
+                continue
+
+            # Strong consistency checks: these are losses belonging to the
+            # two validated role panels, not arbitrary screen numbers.
+            if av.loss > av.total or dv.loss > dv.total:
+                continue
+
+            role_score = min(1.0, (attacker.score + defender.score) / 2.2)
+            confidence = (
+                0.25 * role_score
+                + 0.20 * geo
+                + 0.275 * av.confidence
+                + 0.275 * dv.confidence
             )
 
+            results.append(
+                BattleAnalysis(
+                    attacker_total=av.total,
+                    attacker_loss=av.loss,
+                    defender_total=dv.total,
+                    defender_loss=dv.loss,
+                    confidence=confidence,
+                )
+            )
+
+    if not results:
+        return None
+
+    results.sort(key=lambda r: r.confidence, reverse=True)
+    best = results[0]
+
+    # If two unrelated places on screen somehow both look plausible, do not
+    # guess unless the best candidate is clearly ahead.
+    if len(results) > 1 and best.confidence - results[1].confidence < 0.05:
+        same_values = (
+            best.attacker_total == results[1].attacker_total
+            and best.attacker_loss == results[1].attacker_loss
+            and best.defender_total == results[1].defender_total
+            and best.defender_loss == results[1].defender_loss
+        )
+        if not same_values:
+            return None
+
+    if best.confidence < 0.58:
+        return None
+    return best
+
+
+def analyze_battle_report(image_bytes: bytes) -> Optional[BattleAnalysis]:
+    """Analyze one Goodgame Empire battle-report screenshot."""
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None or img.size == 0:
+        return None
+
+    H, W = img.shape[:2]
+    if H < 60 or W < 180:
+        return None
+
+    items = _ocr_items(img, target_width=1900, psm=11)
+    anchors = _find_role_anchors(items)
+
+    result = _analyze_with_anchors(img, anchors)
+    if result is not None:
+        return result
+
+    # Fallback only when one side/header was OCRed poorly. Re-OCR a thin band
+    # around the strongest known role instead of searching every occurrence
+    # on the whole screenshot with increasingly loose rules.
+    if anchors:
+        strongest = max(anchors, key=lambda a: a.score)
+        recovered = _recover_role_anchors_from_band(img, strongest)
+
+        # Deduplicate approximately identical anchors.
+        merged = list(anchors)
+        for candidate in recovered:
+            duplicate = False
+            for old in merged:
+                if old.role != candidate.role:
+                    continue
+                if (
+                    abs(old.item.box.cx - candidate.item.box.cx) < 0.04 * W
+                    and abs(old.item.box.cy - candidate.item.box.cy) < 0.04 * H
+                ):
+                    duplicate = True
+                    break
+            if not duplicate:
+                merged.append(candidate)
+
+        result = _analyze_with_anchors(img, merged)
+        if result is not None:
+            return result
+
+        one_role = _analyze_from_one_role(img, items, merged)
+        if one_role is not None:
+            return one_role
+
+    # Safety first: no verified battle-result panel pair.
     return None
 
 
-def format_ratio(attacker_loss: int, defender_loss: int) -> str:
-    """Pomer strát útočník : obranca."""
-    if attacker_loss == 0 or defender_loss == 0:
-        return f"{attacker_loss} : {defender_loss}"
-
-    smaller = min(attacker_loss, defender_loss)
-    left = attacker_loss / smaller
-    right = defender_loss / smaller
-
-    def fmt(v: float) -> str:
-        if abs(v - round(v)) < 0.05:
-            return str(int(round(v)))
-        return f"{v:.2f}".rstrip("0").rstrip(".")
-
-    return f"{fmt(left)} : {fmt(right)}"
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
 
 
-def format_defender_killed_percent(defender_loss: int, defender_total: int) -> str:
-    """
-    Vypočíta percento zabitých obrancov:
-        strata obrancu / počet obrancov pred bitkou * 100
-    """
-    if defender_total <= 0:
-        return "0"
+def format_battle_ratio(result: BattleAnalysis) -> str:
+    if result.attacker_loss == 0:
+        if result.defender_loss > 0:
+            return "∞ : 1"
+        return "0 : 0"
+    return f"{result.defender_loss / result.attacker_loss:.2f} : 1"
 
-    percent = (defender_loss / defender_total) * 100
-    return f"{percent:.1f}".rstrip("0").rstrip(".")
+
+def format_defender_loss_percent(result: BattleAnalysis) -> str:
+    pct = result.defender_loss_percent
+    return f"{pct:.2f}".rstrip("0").rstrip(".") + "%"
+
+
+def format_discord_result(result: BattleAnalysis) -> str:
+    return (
+        f"**Battle ratio: {format_battle_ratio(result)}**\n"
+        f"**Straty obrancu: {format_defender_loss_percent(result)}**"
+    )
 
 
 # ---------------------------------------------------------------------------
-# DISCORD BOT
+# Generic discord.py integration helper
 # ---------------------------------------------------------------------------
 
-intents = discord.Intents.default()
-intents.message_content = True
 
-client = discord.Client(intents=intents)
+async def process_discord_message(
+    message,
+    *,
+    failure_reaction: Optional[str] = "❓",
+    reply: bool = True,
+) -> bool:
+    """
+    Process image attachments on an existing discord.py Message.
 
+    No discord.py import is required in this module; it intentionally uses the
+    normal Message/Attachment interface by duck typing, so it can be dropped
+    into an existing Client or commands.Bot project.
 
-@client.event
-async def on_ready():
-    print(f"Prihlásený ako {client.user} (ID: {client.user.id})")
+    Returns True if at least one battle report was successfully analyzed.
+    """
+    author = getattr(message, "author", None)
+    if getattr(author, "bot", False):
+        return False
 
+    attachments = getattr(message, "attachments", None) or []
+    handled = False
 
-@client.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
+    for attachment in attachments:
+        content_type = (getattr(attachment, "content_type", None) or "").lower()
+        filename = (getattr(attachment, "filename", None) or "").lower()
+        is_image = content_type.startswith("image/") or filename.endswith(
+            (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+        )
+        if not is_image:
+            continue
 
-    if ALLOWED_CHANNEL_IDS and message.channel.id not in ALLOWED_CHANNEL_IDS:
-        return
-
-    image_attachments = [
-        a for a in message.attachments
-        if a.content_type and a.content_type.startswith("image/")
-    ]
-
-    if not image_attachments:
-        return
-
-    for attachment in image_attachments:
         try:
             image_bytes = await attachment.read()
-        except discord.HTTPException:
+        except Exception:
             continue
 
-        result = analyze_battle_report(image_bytes)
-
+        result = await asyncio.to_thread(analyze_battle_report, image_bytes)
         if result is None:
-            if FAILURE_REACTION:
-                try:
-                    await message.add_reaction(FAILURE_REACTION)
-                except discord.HTTPException:
-                    pass
             continue
 
-        attacker_loss, defender_loss, defender_total = result
+        handled = True
+        text = format_discord_result(result)
+        try:
+            if reply and hasattr(message, "reply"):
+                await message.reply(text, mention_author=False)
+            else:
+                await message.channel.send(text)
+        except Exception:
+            # Analyzer success should not crash the user's existing bot because
+            # of a Discord permission/network error.
+            pass
 
-        ratio = format_ratio(attacker_loss, defender_loss)
-        killed_percent = format_defender_killed_percent(
-            defender_loss,
-            defender_total,
-        )
+    if not handled and failure_reaction:
+        try:
+            await message.add_reaction(failure_reaction)
+        except Exception:
+            pass
 
-        await message.reply(
-            f"**Battle Report ratio is:  {ratio}**\n"
-            f"**Defenders killed: {killed_percent}%**",
-            mention_author=False,
-        )
+    return handled
+
+
+# ---------------------------------------------------------------------------
+# Optional local test: python gge_battle_ratio.py screenshot.png
+# ---------------------------------------------------------------------------
+
+
+def _main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Analyze a GGE battle report screenshot")
+    parser.add_argument("image", help="Path to PNG/JPG screenshot")
+    args = parser.parse_args()
+
+    with open(args.image, "rb") as f:
+        result = analyze_battle_report(f.read())
+
+    if result is None:
+        print("Battle report not confidently recognized.")
+        return 2
+
+    print(format_discord_result(result).replace("**", ""))
+    print(
+        f"DEBUG: attacker={result.attacker_loss}/{result.attacker_total}, "
+        f"defender={result.defender_loss}/{result.defender_total}, "
+        f"confidence={result.confidence:.3f}"
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    if TOKEN == "VLOZ_SI_TU_TOKEN":
-        raise SystemExit(
-            "Nastav token bota cez premennú prostredia DISCORD_BOT_TOKEN."
-        )
-
-    client.run(TOKEN)
+    raise SystemExit(_main())
