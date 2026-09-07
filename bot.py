@@ -378,7 +378,7 @@ async def on_message(message: discord.Message):
         )
 
         await message.reply(
-            f"**Battle Report ratio is: {ratio}**\n"
+            f"**Battle Report ratio is:  {ratio}**\n"
             f"**Defenders killed: {killed_percent}%**",
             mention_author=False,
         )
