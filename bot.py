@@ -167,6 +167,361 @@ def _ocr_number_from_roi(img_bgr: np.ndarray, rect):
     return max(counts, key=lambda value: (counts[value], value))
 
 
+
+# ---------------------------------------------------------------------------
+# PRESNEJŠIE OCR PRE OREZANÉ / MENEJ KVALITNÉ REPORTY
+# ---------------------------------------------------------------------------
+
+def _find_red_loss_bbox_cropped(img_bgr: np.ndarray, side: str):
+    """
+    Nájde presný bounding box červeného stratového čísla na ľavej/pravej strane.
+
+    Namiesto OCR veľkého výrezu najprv nájdeme samotné červené číslice.
+    To výrazne pomáha pri malých a komprimovaných screenshotoch.
+    """
+    h, w = img_bgr.shape[:2]
+
+    if side == "left":
+        xa, xb = int(0.10 * w), int(0.32 * w)
+    else:
+        xa, xb = int(0.78 * w), int(0.99 * w)
+
+    ya, yb = int(0.48 * h), int(0.95 * h)
+
+    crop = img_bgr[ya:yb, xa:xb]
+    if crop.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+    mask = (
+        cv2.inRange(
+            hsv,
+            np.array([0, 70, 70]),
+            np.array([15, 255, 255]),
+        )
+        |
+        cv2.inRange(
+            hsv,
+            np.array([165, 70, 70]),
+            np.array([180, 255, 255]),
+        )
+    )
+
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
+
+    components = []
+
+    for i in range(1, count):
+        x, y, cw, ch, area = stats[i]
+
+        # Číslice majú určitú minimálnu výšku.
+        # Týmto odfiltrujeme tenké červené čiary a malé grafické artefakty.
+        min_h = max(4, int(0.04 * h))
+        max_h = max(min_h + 1, int(0.16 * h))
+
+        if (
+            ch >= min_h
+            and ch <= max_h
+            and area >= 8
+        ):
+            components.append(
+                (x + xa, y + ya, cw, ch, area)
+            )
+
+    if not components:
+        return None
+
+    # Zoskupíme jednotlivé číslice, ktoré ležia na rovnakom riadku.
+    groups = []
+
+    for comp in sorted(
+        components,
+        key=lambda c: c[1] + c[3] / 2
+    ):
+        cy = comp[1] + comp[3] / 2
+        found = False
+
+        for group in groups:
+            if abs(cy - group["cy"]) <= 0.04 * h:
+                group["items"].append(comp)
+                group["cy"] = sum(
+                    c[1] + c[3] / 2
+                    for c in group["items"]
+                ) / len(group["items"])
+                found = True
+                break
+
+        if not found:
+            groups.append({
+                "cy": cy,
+                "items": [comp],
+            })
+
+    usable = []
+
+    for group in groups:
+        xs = [c[0] for c in group["items"]]
+        ys = [c[1] for c in group["items"]]
+        x2s = [c[0] + c[2] for c in group["items"]]
+        y2s = [c[1] + c[3] for c in group["items"]]
+
+        box = (
+            min(xs),
+            min(ys),
+            max(x2s) - min(xs),
+            max(y2s) - min(ys),
+        )
+
+        total_area = sum(c[4] for c in group["items"])
+
+        # Straty bývajú v spodnej časti panelu.
+        # Kombinujeme veľkosť textu a jeho vertikálnu pozíciu.
+        score = total_area + 0.5 * group["cy"]
+
+        usable.append((score, box))
+
+    if not usable:
+        return None
+
+    return max(usable, key=lambda item: item[0])[1]
+
+
+def _ocr_precise_number_box(img_bgr: np.ndarray, box):
+    """
+    OCR čísla z už presne nájdeného bounding boxu.
+
+    Skúša viac mierok, thresholdov a PSM režimov.
+    Výsledok vyberie hlasovaním.
+    """
+    x, y, w, h = [int(v) for v in box]
+    img_h, img_w = img_bgr.shape[:2]
+
+    pad_x = max(5, int(0.25 * w))
+    pad_y = max(3, int(0.25 * h))
+
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - pad_y)
+    x1 = min(img_w, x + w + pad_x)
+    y1 = min(img_h, y + h + pad_y)
+
+    crop = img_bgr[y0:y1, x0:x1]
+
+    if crop.size == 0:
+        return None
+
+    candidates = []
+
+    for scale in (4, 6, 8):
+        big = cv2.resize(
+            crop,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+
+        otsu = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )[1]
+
+        for processed in (gray, otsu):
+            for psm in (7, 8, 13):
+                text = pytesseract.image_to_string(
+                    processed,
+                    config=(
+                        f"--psm {psm} "
+                        "-c tessedit_char_whitelist=0123456789-"
+                    ),
+                )
+
+                digits = re.sub(r"[^0-9]", "", text)
+
+                if digits:
+                    try:
+                        candidates.append(int(digits))
+                    except ValueError:
+                        pass
+
+    if not candidates:
+        return None
+
+    counts = {}
+
+    for value in candidates:
+        counts[value] = counts.get(value, 0) + 1
+
+    # Najprv počet hlasov. Pri zhode preferujeme kratšie číslo,
+    # aby jeden OCR artefakt nepridal náhodnú číslicu na začiatok.
+    return max(
+        counts,
+        key=lambda value: (
+            counts[value],
+            -len(str(value)),
+        ),
+    )
+
+
+def _ocr_total_above_loss(img_bgr: np.ndarray, loss_box):
+    """
+    Celkový počet vojska je priamo nad červenými stratami.
+    Preto ho čítame relatívne k už presne nájdenému loss boxu.
+    """
+    x, y, w, h = [int(v) for v in loss_box]
+    img_h, img_w = img_bgr.shape[:2]
+
+    x0 = max(0, x - int(0.35 * w))
+    x1 = min(img_w, x + w + int(0.35 * w))
+
+    y0 = max(0, y - int(2.4 * h))
+    y1 = max(0, y - int(0.35 * h))
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    crop = img_bgr[y0:y1, x0:x1]
+
+    if crop.size == 0:
+        return None
+
+    candidates = []
+
+    for scale in (4, 6, 8):
+        big = cv2.resize(
+            crop,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+
+        otsu = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )[1]
+
+        for processed in (gray, otsu):
+            for psm in (7, 8, 13):
+                text = pytesseract.image_to_string(
+                    processed,
+                    config=(
+                        f"--psm {psm} "
+                        "-c tessedit_char_whitelist=0123456789 "
+                    ),
+                )
+
+                digits = re.sub(r"[^0-9]", "", text)
+
+                if digits:
+                    try:
+                        candidates.append(int(digits))
+                    except ValueError:
+                        pass
+
+    if not candidates:
+        return None
+
+    counts = {}
+
+    for value in candidates:
+        counts[value] = counts.get(value, 0) + 1
+
+    return max(
+        counts,
+        key=lambda value: (
+            counts[value],
+            -len(str(value)),
+        ),
+    )
+
+
+def _analyze_cropped_report_precise(img_bgr: np.ndarray):
+    """
+    Presná analýza širokého orezaného reportu.
+
+    1. OCR nadpisov určí, kde je Obranca / Defender.
+    2. Červenou maskou nájdeme presnú polohu oboch stratových čísel.
+    3. Každé číslo čítame niekoľkokrát a výsledky hlasujú.
+    4. Počet obrancov čítame priamo nad jeho stratovým číslom.
+    """
+    left_label = _ocr_label(
+        img_bgr,
+        (0.00, 0.00, 0.35, 0.27),
+    )
+
+    right_label = _ocr_label(
+        img_bgr,
+        (0.65, 0.00, 1.00, 0.27),
+    )
+
+    left_score = _defender_score(left_label)
+    right_score = _defender_score(right_label)
+
+    if max(left_score, right_score) < 0.50:
+        return None
+
+    left_loss_box = _find_red_loss_bbox_cropped(
+        img_bgr, "left"
+    )
+
+    right_loss_box = _find_red_loss_bbox_cropped(
+        img_bgr, "right"
+    )
+
+    if left_loss_box is None or right_loss_box is None:
+        return None
+
+    left_loss = _ocr_precise_number_box(
+        img_bgr,
+        left_loss_box,
+    )
+
+    right_loss = _ocr_precise_number_box(
+        img_bgr,
+        right_loss_box,
+    )
+
+    if left_loss is None or right_loss is None:
+        return None
+
+    if left_score > right_score:
+        defender_loss = left_loss
+        attacker_loss = right_loss
+        defender_total = _ocr_total_above_loss(
+            img_bgr,
+            left_loss_box,
+        )
+    else:
+        defender_loss = right_loss
+        attacker_loss = left_loss
+        defender_total = _ocr_total_above_loss(
+            img_bgr,
+            right_loss_box,
+        )
+
+    if defender_total is None or defender_total <= 0:
+        return None
+
+    # Logická kontrola: nemôže zomrieť viac obrancov,
+    # než ich bolo pred bitkou.
+    if defender_loss > defender_total:
+        return None
+
+    return attacker_loss, defender_loss, defender_total
+
+
+
 # ---------------------------------------------------------------------------
 # LAYOUTY BATTLE REPORTU
 # ---------------------------------------------------------------------------
@@ -250,7 +605,9 @@ def analyze_battle_report(image_bytes: bytes):
     Vráti:
         (attacker_loss, defender_loss, defender_total)
 
-    defender_total = počet obrancov pred bitkou.
+    Pri širokých orezaných reportoch používa presnejšiu detekciu
+    samotných červených číslic. Pri celých screenshotoch ostáva
+    pôvodný layoutový fallback.
     """
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -258,6 +615,17 @@ def analyze_battle_report(image_bytes: bytes):
     if img is None:
         return None
 
+    h, w = img.shape[:2]
+    aspect = w / max(1, h)
+
+    # Presnejší režim pre orezané battle reporty.
+    if aspect >= 2.5:
+        precise = _analyze_cropped_report_precise(img)
+
+        if precise is not None:
+            return precise
+
+    # Fallback pre celé screenshoty alebo atypický orez.
     for panels in _get_layouts(img):
         left, right = panels
 
@@ -267,7 +635,6 @@ def analyze_battle_report(image_bytes: bytes):
         left_score = _defender_score(left_label)
         right_score = _defender_score(right_label)
 
-        # Musíme vedieť, ktorá strana je Obranca / Defender.
         if max(left_score, right_score) < 0.55:
             continue
 
@@ -278,17 +645,33 @@ def analyze_battle_report(image_bytes: bytes):
             defender_panel = right
             attacker_panel = left
 
-        attacker_loss = _ocr_number_from_roi(img, attacker_panel["loss"])
-        defender_loss = _ocr_number_from_roi(img, defender_panel["loss"])
-        defender_total = _ocr_number_from_roi(img, defender_panel["total"])
+        attacker_loss = _ocr_number_from_roi(
+            img,
+            attacker_panel["loss"],
+        )
+
+        defender_loss = _ocr_number_from_roi(
+            img,
+            defender_panel["loss"],
+        )
+
+        defender_total = _ocr_number_from_roi(
+            img,
+            defender_panel["total"],
+        )
 
         if (
             attacker_loss is not None
             and defender_loss is not None
             and defender_total is not None
             and defender_total > 0
+            and defender_loss <= defender_total
         ):
-            return attacker_loss, defender_loss, defender_total
+            return (
+                attacker_loss,
+                defender_loss,
+                defender_total,
+            )
 
     return None
 
