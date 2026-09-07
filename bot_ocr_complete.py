@@ -10,7 +10,7 @@ What it does
 - Works with full screenshots and cropped battle-result screenshots.
 - Extracts attacker losses, defender losses and defender total troops.
 - Replies only with:
-    Battle ratio: X.XX : 1
+    Battle ratio: 1 : X.XX
     Straty obrancu: XX.XX %
 
 The detector deliberately requires a consistent attacker/defender pair plus the
@@ -1341,17 +1341,30 @@ def analyze_battle_report(image_bytes: bytes) -> Optional[BattleResult]:
 
 
 def format_battle_ratio(attacker_loss: int, defender_loss: int) -> str:
-    """Battle ratio = defender losses / attacker losses, shown as X.XX : 1."""
+    """
+    Normalize the battle ratio so the attacker is always 1.
+
+    Example:
+        attacker losses = 6 438
+        defender losses = 138 318
+        -> 1 : 21.48
+    """
     if attacker_loss < 0 or defender_loss < 0:
         raise ValueError("Losses cannot be negative")
 
+    # A flawless attack cannot be normalized by dividing by attacker losses.
     if attacker_loss == 0:
         if defender_loss == 0:
-            return "0.00 : 0"
-        return "∞ : 1"
+            return "1 : 1.00"
+        return "1 : ∞"
 
     ratio = defender_loss / attacker_loss
-    return f"{ratio:.2f} : 1"
+    return f"1 : {ratio:.2f}"
+
+
+def attacker_is_weak(attacker_loss: int, defender_loss: int) -> bool:
+    """True when the attacker's battle ratio is worse than 1:1."""
+    return attacker_loss > defender_loss
 
 
 def format_defender_loss_percent(defender_loss: int, defender_total: int) -> str:
@@ -1366,10 +1379,15 @@ def format_reply(result: BattleResult) -> str:
     ratio = format_battle_ratio(result.attacker_loss, result.defender_loss)
     percent = format_defender_loss_percent(result.defender_loss, result.defender_total)
 
-    return (
+    reply = (
         f"⚔️ **Battle ratio:** `{ratio}`\n"
         f"🛡️ **Straty obrancu:** `{percent}`"
     )
+
+    if attacker_is_weak(result.attacker_loss, result.defender_loss):
+        reply += "\n💀 **You are weak!**"
+
+    return reply
 
 
 # =============================================================================
@@ -1500,3 +1518,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
+                
