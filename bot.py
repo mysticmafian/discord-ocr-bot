@@ -36,7 +36,7 @@ ALLOWED_CHANNEL_IDS = []  # napr. [123456789012345678]
 
 # Ak sa nepodarí rozpoznať dve čísla, bot môže na správu reagovať emoji,
 # aby bolo jasné, že screenshot nevie spracovať. Nastav na None, ak nechceš.
-FAILURE_REACTION = "❓"
+FAILURE_REACTION = ""
 
 # Windows: ak Tesseract nie je v PATH, odkomentuj a nastav cestu, napr.:
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
