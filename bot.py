@@ -460,6 +460,48 @@ def _read_panel_values(
 # V7 FAST PATH PRE OREZANE REPORTY
 # ---------------------------------------------------------------------------
 
+def _verify_red_loss(panel, loss_row, total_row):
+    """Read the complete red line independently; reject uncertain OCR."""
+    H, W = panel.shape[:2]
+    x, y, w, h = loss_row["box"]
+    tx, _, tw, _ = total_row["box"]
+    # Extend horizontally: the main OCR may have dropped a thousands group.
+    x0 = max(int(0.35 * W), int(min(x, tx) - 0.12 * W))
+    x1 = min(W, int(max(x + w, tx + tw) + 0.08 * W))
+    y0, y1 = max(0, int(y - 2)), min(H, int(y + h + 3))
+    crop = panel[y0:y1, x0:x1]
+    if not crop.size:
+        return None
+
+    blue, green, red = cv2.split(crop.astype(np.int16))
+    red_pixels = (red - green > 40) & (red - blue > 40) & (red > 100)
+    if np.count_nonzero(red_pixels) < 8:
+        return None
+    ink = np.clip((red - green - 30) * 2, 0, 255)
+    mask = (255 - ink).astype(np.uint8)
+    ys, xs = np.nonzero(red_pixels)
+    bounds = (slice(max(0, ys.min() - 1), min(crop.shape[0], ys.max() + 2)),
+              slice(max(0, xs.min() - 1), min(crop.shape[1], xs.max() + 2)))
+    values = []
+    for source in (mask, cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)):
+        source = source[bounds]
+        enlarged = cv2.resize(source, None, fx=5, fy=5,
+                              interpolation=cv2.INTER_CUBIC)
+        enlarged = cv2.copyMakeBorder(enlarged, 15, 15, 15, 15,
+                                     cv2.BORDER_CONSTANT, value=255)
+        text = pytesseract.image_to_string(
+            enlarged,
+            config="--psm 7 -c tessedit_char_whitelist=0123456789-",
+        ).strip()
+        # Never concatenate separate OCR lines into one large number.
+        if not re.fullmatch(r"-?\s*[0-9][0-9 ]*", text):
+            return None
+        values.append(int(re.sub(r"[^0-9]", "", text)))
+    if values[0] != values[1] or not 0 < values[0] <= total_row["value"]:
+        return None
+    return values[0]
+
+
 def _ocr_side_panel_cropped(img_bgr: np.ndarray, side: str):
     """
     Pri širokom orezanom reporte OCRujeme každý bočný panel zvlášť.
@@ -593,7 +635,12 @@ def _ocr_side_panel_cropped(img_bgr: np.ndarray, side: str):
         except ValueError:
             continue
 
+        x0 = min(item["x"] for item in items)
+        y0 = min(item["y"] for item in items)
+        x1 = max(item["x"] + item["w"] for item in items)
+        y1 = max(item["y"] + item["h"] for item in items)
         parsed.append({
+            "box": (x0, y0, x1 - x0, y1 - y0),
             "cy": group["cy"],
             "value": value,
             "has_minus": any("-" in item["text"] for item in items),
@@ -644,12 +691,16 @@ def _ocr_side_panel_cropped(img_bgr: np.ndarray, side: str):
 
         if best_score is None or score > best_score:
             best_score = score
-            best_pair = (total, loss)
+            best_pair = (total_row, loss_row)
 
     if best_pair is None:
         return None
 
-    total, loss = best_pair
+    total_row, loss_row = best_pair
+    total = total_row["value"]
+    loss = _verify_red_loss(panel, loss_row, total_row)
+    if loss is None:
+        return None
 
     return {
         "total": total,
@@ -729,6 +780,8 @@ def analyze_battle_report(image_bytes: bytes):
                 flush=True,
             )
             return cropped_result
+        # Do not bypass a failed verification via the less strict photo path.
+        return None
 
     # Celý screenshot alebo fotografia obrazovky:
     # použije sa dynamický V6 režim, ktorý lokalizuje Obranca/Defender
