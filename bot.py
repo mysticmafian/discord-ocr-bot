@@ -16,6 +16,7 @@ Nova logika:
 """
 
 import os
+import asyncio
 import re
 import unicodedata
 from difflib import SequenceMatcher
@@ -29,7 +30,7 @@ from pytesseract import Output
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "VLOZ_SI_TU_TOKEN")
 ALLOWED_CHANNEL_IDS = []
-FAILURE_REACTION = ""
+FAILURE_REACTION = "❓"
 
 
 # ---------------------------------------------------------------------------
@@ -299,103 +300,6 @@ def _numeric_groups_near_panel(
     return sorted(result, key=lambda g: g["cy"])
 
 
-def _ocr_loss_below_total(
-    img_bgr: np.ndarray,
-    total_box,
-):
-    """
-    Fallback iba pre rozmazany loss riadok.
-
-    Pouziva presnu polohu horneho cisla a cita maly riadok priamo pod nim.
-    Kandidat s '-' ma prednost, lebo stratovy riadok je zaporny.
-    """
-    x, y, w, h = total_box
-    H, W = img_bgr.shape[:2]
-
-    x0 = max(0, int(x - 0.28 * w - 8))
-    x1 = min(W, int(x + w + 0.28 * w + 8))
-
-    # Zacneme az POD hornym riadkom, aby sa total a loss nezlepili do jedneho cisla.
-    y0 = max(0, int(y + 1.15 * h))
-    y1 = min(H, int(y + 3.80 * h))
-
-    crop = img_bgr[y0:y1, x0:x1]
-
-    if crop.size == 0:
-        return None
-
-    candidates = []
-
-    for scale in (2, 3):
-        big = cv2.resize(
-            crop,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC,
-        )
-
-        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
-
-        # Jemne rozmazanie potlaci moire z fotografie monitora.
-        gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
-
-        for processed in (gray, gray_blur):
-            for psm in (7, 11):
-                text = pytesseract.image_to_string(
-                    processed,
-                    config=(
-                        f"--psm {psm} "
-                        "-c tessedit_char_whitelist=0123456789-"
-                    ),
-                ).strip()
-
-                digits = re.sub(r"[^0-9]", "", text)
-
-                if not digits:
-                    continue
-
-                try:
-                    value = int(digits)
-                except ValueError:
-                    continue
-
-                if value <= 0:
-                    continue
-
-                candidates.append({
-                    "value": value,
-                    "negative": "-" in text,
-                })
-
-    if not candidates:
-        return None
-
-    # Najprv hlasovanie medzi vysledkami s minusom.
-    negatives = [
-        c["value"]
-        for c in candidates
-        if c["negative"]
-    ]
-
-    pool = negatives if negatives else [
-        c["value"] for c in candidates
-    ]
-
-    counts = {}
-
-    for value in pool:
-        counts[value] = counts.get(value, 0) + 1
-
-    return max(
-        counts,
-        key=lambda value: (
-            counts[value],
-            -len(str(value)),
-        ),
-    )
-
-
 def _read_panel_values(
     img_bgr,
     rows,
@@ -424,32 +328,8 @@ def _read_panel_values(
     if total <= 0:
         return None
 
-    loss = None
-
-    # Druhy riadok je loss. Ked ho hlavny OCR precital kvalitne a vidi '-',
-    # pouzijeme ho okamzite bez dalsieho Tesseract volania.
-    if len(groups) >= 2:
-        loss_group = groups[1]
-
-        if (
-            loss_group["has_minus"]
-            and loss_group["avg_conf"] >= 45
-            and 0 < loss_group["value"] <= total
-        ):
-            loss = loss_group["value"]
-
-    # Nekvalitna fotka: precitaj iba maly riadok pod total.
+    loss = _read_loss_line(img_bgr, total_group["box"], total)
     if loss is None:
-        loss = _ocr_loss_below_total(
-            img_bgr,
-            total_group["box"],
-        )
-
-    if loss is None or loss <= 0:
-        return None
-
-    # Matematicka kontrola.
-    if loss > total:
         return None
 
     return total, loss
@@ -460,46 +340,39 @@ def _read_panel_values(
 # V7 FAST PATH PRE OREZANE REPORTY
 # ---------------------------------------------------------------------------
 
-def _verify_red_loss(panel, loss_row, total_row):
-    """Read the complete red line independently; reject uncertain OCR."""
-    H, W = panel.shape[:2]
-    x, y, w, h = loss_row["box"]
-    tx, _, tw, _ = total_row["box"]
-    # Extend horizontally: the main OCR may have dropped a thousands group.
-    x0 = max(int(0.35 * W), int(min(x, tx) - 0.12 * W))
-    x1 = min(W, int(max(x + w, tx + tw) + 0.08 * W))
-    y0, y1 = max(0, int(y - 2)), min(H, int(y + h + 3))
-    crop = panel[y0:y1, x0:x1]
-    if not crop.size:
+def _read_loss_line(img, total_box, total):
+    """Read one complete line below the total, without icons or panel borders."""
+    x, y, w, h = total_box
+    H, W = img.shape[:2]
+    votes = {}
+    for left_margin, top, bottom in ((.2, 1.5, 3.3), (.05, 1.4, 3.05), (.3, 1.4, 3.0)):
+        crop = img[max(0, int(y + top * h)):min(H, int(y + bottom * h)),
+                   max(0, int(x - left_margin * w)):min(W, int(x + 1.15 * w))]
+        if not crop.size:
+            continue
+        blue, green, red = cv2.split(crop.astype(np.int16))
+        if np.count_nonzero((red - green > 30) & (red - blue > 30)) < 5:
+            continue
+        for source in (cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), crop[:, :, 1]):
+            big = cv2.resize(source, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            for psm in (7, 13):
+                text = pytesseract.image_to_string(
+                    big, config=f"--psm {psm} -c tessedit_char_whitelist=0123456789-"
+                ).strip()
+                if not re.fullmatch(r"-* *[0-9][0-9 ]*", text):
+                    continue
+                value = int(re.sub(r"[^0-9]", "", text))
+                if 0 < value <= total:
+                    votes[value] = votes.get(value, 0) + 1
+        if len(votes) == 1 and max(votes.values()) >= 4:
+            return next(iter(votes))
+    ranked = sorted(votes, key=votes.get, reverse=True)
+    if not ranked or votes[ranked[0]] < 3:
         return None
+    if len(ranked) > 1 and votes[ranked[0]] - votes[ranked[1]] < 2:
+        return None
+    return ranked[0]
 
-    blue, green, red = cv2.split(crop.astype(np.int16))
-    red_pixels = (red - green > 40) & (red - blue > 40) & (red > 100)
-    if np.count_nonzero(red_pixels) < 8:
-        return None
-    ink = np.clip((red - green - 30) * 2, 0, 255)
-    mask = (255 - ink).astype(np.uint8)
-    ys, xs = np.nonzero(red_pixels)
-    bounds = (slice(max(0, ys.min() - 1), min(crop.shape[0], ys.max() + 2)),
-              slice(max(0, xs.min() - 1), min(crop.shape[1], xs.max() + 2)))
-    values = []
-    for source in (mask, cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)):
-        source = source[bounds]
-        enlarged = cv2.resize(source, None, fx=5, fy=5,
-                              interpolation=cv2.INTER_CUBIC)
-        enlarged = cv2.copyMakeBorder(enlarged, 15, 15, 15, 15,
-                                     cv2.BORDER_CONSTANT, value=255)
-        text = pytesseract.image_to_string(
-            enlarged,
-            config="--psm 7 -c tessedit_char_whitelist=0123456789-",
-        ).strip()
-        # Never concatenate separate OCR lines into one large number.
-        if not re.fullmatch(r"-?\s*[0-9][0-9 ]*", text):
-            return None
-        values.append(int(re.sub(r"[^0-9]", "", text)))
-    if values[0] != values[1] or not 0 < values[0] <= total_row["value"]:
-        return None
-    return values[0]
 
 
 def _ocr_side_panel_cropped(img_bgr: np.ndarray, side: str):
@@ -567,7 +440,7 @@ def _ocr_side_panel_cropped(img_bgr: np.ndarray, side: str):
 
         digits = re.sub(r"[^0-9]", "", text)
 
-        if digits:
+        if digits and x >= 0.40 * panel.shape[1] and re.fullmatch(r"[-0-9 .,]+", text):
             numeric_tokens.append({
                 "text": text,
                 "digits": digits,
@@ -580,10 +453,11 @@ def _ocr_side_panel_cropped(img_bgr: np.ndarray, side: str):
 
     # Určenie roly panelu. Stačí, keď spoľahlivo nájdeme Obranca/Defender
     # na jednej strane; druhá strana je potom útočník.
-    joined_text = " ".join(text_tokens)
-
-    defender_score = _is_defender(joined_text)
-    attacker_score = _is_attacker(joined_text)
+    header = panel[:max(1, int(.18 * H)), :]
+    header = cv2.resize(header, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    header_text = pytesseract.image_to_string(header, config="--psm 7")
+    defender_score = _is_defender(header_text)
+    attacker_score = _is_attacker(header_text)
 
     # Zoskupíme čísla podľa horizontálneho riadku.
     groups = []
@@ -652,53 +526,16 @@ def _ocr_side_panel_cropped(img_bgr: np.ndarray, side: str):
 
     parsed.sort(key=lambda row: row["cy"])
 
-    # Hľadáme dvojicu susedných číselných riadkov:
-    # horný = total, spodný = loss.
-    best_pair = None
-    best_score = None
-
-    for i in range(len(parsed) - 1):
-        total_row = parsed[i]
-        loss_row = parsed[i + 1]
-
-        gap = loss_row["cy"] - total_row["cy"]
-
-        if gap <= 0:
+    # Icons can look like digits. Only totals in the number column can
+    # anchor a loss read; the loss itself need not appear in the main OCR.
+    total = loss = None
+    for candidate in parsed:
+        if candidate["has_minus"] or candidate["confidence"] < 45:
             continue
-
-        # Pri rôznych výškach cropu môže byť rozostup rôzny,
-        # ale stále ide o dva blízke riadky.
-        if gap > 0.22 * H:
-            continue
-
-        total = total_row["value"]
-        loss = loss_row["value"]
-
-        if total <= 0 or loss <= 0 or loss > total:
-            continue
-
-        score = 0.0
-
-        # Mínus na spodnom riadku je veľmi silný signál.
-        if loss_row["has_minus"]:
-            score += 5.0
-
-        score += min(2.0, loss_row["confidence"] / 50.0)
-        score += min(2.0, total_row["confidence"] / 50.0)
-
-        # Preferujeme nižšiu dvojicu, pretože total/loss je pod názvom hráča.
-        score += loss_row["cy"] / max(1.0, H)
-
-        if best_score is None or score > best_score:
-            best_score = score
-            best_pair = (total_row, loss_row)
-
-    if best_pair is None:
-        return None
-
-    total_row, loss_row = best_pair
-    total = total_row["value"]
-    loss = _verify_red_loss(panel, loss_row, total_row)
+        detected = _read_loss_line(panel, candidate["box"], candidate["value"])
+        if detected is not None:
+            total, loss = candidate["value"], detected
+            break
     if loss is None:
         return None
 
@@ -724,16 +561,10 @@ def _analyze_cropped_v7(img_bgr: np.ndarray):
     left_role = left["defender_score"] + right["attacker_score"]
     right_role = right["defender_score"] + left["attacker_score"]
 
-    if max(left_role, right_role) < 0.45:
-        # Ak OCR nezachytil Útočník, stále stačí samotný Obranca/Defender.
-        if left["defender_score"] > right["defender_score"]:
-            left_role = 1.0
-            right_role = 0.0
-        elif right["defender_score"] > left["defender_score"]:
-            right_role = 1.0
-            left_role = 0.0
-        else:
-            return None
+    if max(left["defender_score"], right["defender_score"]) < .65:
+        return None
+    if abs(left_role - right_role) < .25:
+        return None
 
     if left_role > right_role:
         defender = left
@@ -941,7 +772,7 @@ async def on_message(message: discord.Message):
         except discord.HTTPException:
             continue
 
-        result = analyze_battle_report(image_bytes)
+        result = await asyncio.to_thread(analyze_battle_report, image_bytes)
 
         if result is None:
             if FAILURE_REACTION:
