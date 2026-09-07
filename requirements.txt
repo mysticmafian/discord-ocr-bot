@@ -1,0 +1,4 @@
+discord.py>=2.4,<3
+numpy>=2.0,<3
+opencv-python-headless>=4.10,<5
+pytesseract>=0.3.13,<1
