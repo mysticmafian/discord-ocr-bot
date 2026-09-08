@@ -1385,7 +1385,7 @@ def format_reply(result: BattleResult) -> str:
     )
 
     if attacker_is_weak(result.attacker_loss, result.defender_loss):
-        reply += "\n💀 **You are weak!**"
+        reply += "\n💀 **Slabý útok!**"
 
     return reply
 
