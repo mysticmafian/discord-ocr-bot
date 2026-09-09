@@ -156,6 +156,7 @@ class BattleResult:
     defender_loss: int
     defender_total: int
     confidence: float
+    is_rift: bool = False
 
 
 @dataclass(frozen=True)
@@ -663,6 +664,58 @@ def _read_total_above_loss(
     )
 
 
+def _looks_like_gray_name_bar(crop: np.ndarray) -> bool:
+    if crop is None or crop.size == 0:
+        return False
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    visible = val >= 70
+    if not np.any(visible):
+        return False
+
+    visible_sat = sat[visible]
+    low_saturation_ratio = float(np.mean(visible_sat <= 55))
+    colored_ratio = float(np.mean((sat > 70) & (val > 90)))
+    median_saturation = float(np.median(visible_sat))
+
+    return (
+        median_saturation <= 45
+        and low_saturation_ratio >= 0.62
+        and colored_ratio <= 0.35
+    )
+
+
+def _is_gray_name_bar_near_label(img: np.ndarray, label: LabelCandidate) -> bool:
+    img_h, img_w = img.shape[:2]
+    x0 = max(0, int(label.x - 1.1 * label.w))
+    x1 = min(img_w, int(label.x + 2.4 * label.w))
+    y0 = max(0, int(label.bottom + 0.35 * label.h))
+    y1 = min(img_h, int(label.bottom + 3.3 * label.h))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    return _looks_like_gray_name_bar(img[y0:y1, x0:x1])
+
+
+def _is_gray_name_bar_above_loss(
+    img: np.ndarray, loss_box: tuple[int, int, int, int]
+) -> bool:
+    img_h, img_w = img.shape[:2]
+    x, y, bw, bh = loss_box
+    x0 = max(0, int(x - 1.6 * bw))
+    x1 = min(img_w, int(x + 2.2 * bw))
+    y0 = max(0, int(y - 5.6 * bh))
+    y1 = min(img_h, int(y - 2.0 * bh))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    return _looks_like_gray_name_bar(img[y0:y1, x0:x1])
+
+
+def _rift_result() -> BattleResult:
+    return BattleResult(0, 0, 1, 1.0, is_rift=True)
+
+
 def _extract_panel(img: np.ndarray, label: LabelCandidate) -> Optional[PanelData]:
     loss = _find_loss_number(img, label)
     if loss is None:
@@ -1018,6 +1071,10 @@ def _analyze_by_loss_anchors(img: np.ndarray) -> Optional[BattleResult]:
             attacker_loss, attacker_box = right_value, right_box
             defender_loss, defender_box = left_value, left_box
 
+        if _is_gray_name_bar_above_loss(img, defender_box):
+            _debug("anchor fallback detected gray defender name bar; treating as rift")
+            return _rift_result()
+
         # Prefer the paired colored component directly above the defender loss.
         total_box = _find_total_box_above(defender_box, boxes)
         defender_total = None
@@ -1190,10 +1247,16 @@ def _analyze_from_single_role(
             continue
 
         if label.role == "defender":
+            if _is_gray_name_bar_near_label(img, label):
+                _debug("single-role rescue detected gray defender name bar; treating as rift")
+                return _rift_result()
             attacker_loss = opposite.value
             defender_loss = panel.loss
             defender_total = panel.total
         else:
+            if _is_gray_name_bar_above_loss(img, (opposite.x, opposite.y, opposite.w, opposite.h)):
+                _debug("single-role rescue detected gray inferred defender name bar; treating as rift")
+                return _rift_result()
             attacker_loss = panel.loss
             defender_loss = opposite.value
             defender_total = _read_total_above_loss(
@@ -1309,6 +1372,10 @@ def _analyze_by_role_labels(img: np.ndarray) -> Optional[BattleResult]:
             defender = panel_cache[def_label]
             if attacker is None or defender is None:
                 continue
+
+            if _is_gray_name_bar_near_label(img, def_label):
+                _debug("role-label detector detected gray defender name bar; treating as rift")
+                return _rift_result()
 
             score = _pair_score(attacker, defender, img)
             if score is None:
@@ -2207,6 +2274,13 @@ def create_discord_client():
                 continue
 
             any_success = True
+            if result.is_rift:
+                try:
+                    await message.reply("rift sa nepočíta", mention_author=False)
+                except discord.HTTPException as exc:
+                    print(f"[GGE] Failed to send Discord reply: {exc}", file=sys.stderr)
+                continue
+
             try:
                 await stats_ready.wait()
                 record_result = await stats_store.record_battle(

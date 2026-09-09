@@ -11,6 +11,9 @@ Každý úspešne rozpoznaný obrázok sa započíta autorovi správy ako jeden 
 - zabití nepriatelia = straty obrancu,
 - priemerné ratio = celkoví zabití / celkové vlastné straty (vážený priemer).
 
+Ak je obranca v reporte sivý, bot ho považuje za rift a odpovie iba
+`rift sa nepočíta`. Takýto report nepočíta do štatistík hráča ani aliancie.
+
 Hráč si svoje štatistiky zobrazí slash príkazom `/stats` a vyberie si obdobie
 `1 deň`, `7 dní` alebo `Celé obdobie`. Rovnaká príloha sa v rámci pôvodnej
 Discord správy nezapočíta dvakrát.

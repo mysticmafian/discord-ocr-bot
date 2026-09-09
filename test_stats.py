@@ -9,10 +9,21 @@ from bot_ocr_complete import (
     StatsStore,
     format_leaderboard,
     format_player_stats,
+    _looks_like_gray_name_bar,
 )
 
 
 class StatsStoreTests(unittest.TestCase):
+    def test_gray_name_bar_detection(self):
+        import numpy as np
+
+        gray_bar = np.full((20, 120, 3), 155, dtype=np.uint8)
+        gold_bar = np.zeros((20, 120, 3), dtype=np.uint8)
+        gold_bar[:, :] = (50, 150, 205)
+
+        self.assertTrue(_looks_like_gray_name_bar(gray_bar))
+        self.assertFalse(_looks_like_gray_name_bar(gold_bar))
+
     def test_store_aggregates_and_deduplicates_reports(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
