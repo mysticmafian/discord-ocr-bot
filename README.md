@@ -15,9 +15,16 @@ Hráč si svoje štatistiky zobrazí slash príkazom `/stats` a vyberie si obdob
 `1 deň`, `7 dní` alebo `Celé obdobie`. Rovnaká príloha sa v rámci pôvodnej
 Discord správy nezapočíta dvakrát.
 
+Bot navyše porovnáva vlastné straty a zabitých nepriateľov s predchádzajúcimi
+reportmi daného hráča. Ak hráč pošle rovnaký report ako novú prílohu, bot znovu
+zobrazí ratio a percentá, ale report druhýkrát do štatistík nepridá.
+
 Administrátor môže cez `/stats-reset` vybrať hráča aj obdobie, ktorého uložené
 reporty sa majú vymazať. Bot oprávnenie Administrátor kontroluje aj pri vykonaní
 príkazu.
+
+Príkaz `/stats-alliance` s rovnakým výberom obdobia zobrazí spoločný súhrn
+všetkých hráčov na Discord serveri.
 
 ## Railway
 

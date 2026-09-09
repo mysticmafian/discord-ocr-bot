@@ -38,6 +38,69 @@ class StatsStoreTests(unittest.TestCase):
             stats = asyncio.run(scenario())
             self.assertEqual(stats, PlayerStats(2, 150, 400))
 
+    def test_same_losses_in_different_messages_are_duplicate_for_player(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
+
+            async def scenario():
+                await store.initialize()
+                result = BattleResult(123, 456, 900, 1.0)
+                first = await store.record_battle(
+                    guild_id=1, message_id=30, attachment_id=300,
+                    player_id=9, player_name="Knight", result=result,
+                )
+                second = await store.record_battle(
+                    guild_id=1, message_id=31, attachment_id=301,
+                    player_id=9, player_name="Knight", result=result,
+                )
+                stats = await store.get_player_stats(1, 9)
+                return first, second, stats
+
+            first, second, stats = asyncio.run(scenario())
+            self.assertTrue(first)
+            self.assertFalse(second)
+            self.assertEqual(stats, PlayerStats(1, 123, 456))
+
+    def test_same_losses_can_be_counted_for_different_players(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
+
+            async def scenario():
+                await store.initialize()
+                result = BattleResult(50, 80, 100, 1.0)
+                await store.record_battle(
+                    guild_id=1, message_id=40, attachment_id=400,
+                    player_id=10, player_name="One", result=result,
+                )
+                return await store.record_battle(
+                    guild_id=1, message_id=41, attachment_id=401,
+                    player_id=11, player_name="Two", result=result,
+                )
+
+            self.assertTrue(asyncio.run(scenario()))
+
+    def test_alliance_stats_aggregate_all_players(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
+
+            async def scenario():
+                await store.initialize()
+                await store.record_battle(
+                    guild_id=1, message_id=50, attachment_id=500,
+                    player_id=12, player_name="One",
+                    result=BattleResult(100, 250, 300, 1.0),
+                )
+                await store.record_battle(
+                    guild_id=1, message_id=51, attachment_id=501,
+                    player_id=13, player_name="Two",
+                    result=BattleResult(50, 150, 200, 1.0),
+                )
+                return await store.get_alliance_stats(1)
+
+            self.assertEqual(
+                asyncio.run(scenario()), PlayerStats(2, 150, 400)
+            )
+
     def test_period_filter_and_admin_reset(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))

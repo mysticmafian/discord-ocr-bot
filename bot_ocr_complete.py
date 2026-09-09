@@ -1500,7 +1500,12 @@ class StatsStore:
         player_name: str,
         result: BattleResult,
     ) -> bool:
-        """Store a report once. Returns False when it was already counted."""
+        """Store a report once per player and loss pair.
+
+        A different Discord upload with the same own/enemy losses is treated as
+        the same battle for that player. The PostgreSQL advisory lock makes the
+        check atomic even if two images finish OCR at the same time.
+        """
         values = (
             guild_id,
             message_id,
@@ -1511,21 +1516,46 @@ class StatsStore:
             result.defender_loss,
         )
         if self.pool is not None:
-            status = await self.pool.execute(
-                """
-                INSERT INTO battle_reports (
-                    guild_id, message_id, attachment_id, player_id, player_name,
-                    own_losses, enemy_kills
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (guild_id, message_id, attachment_id) DO NOTHING
-                """,
-                *values,
-            )
-            return status == "INSERT 0 1"
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    fingerprint = f"{guild_id}:{player_id}:{result.attacker_loss}:{result.defender_loss}"
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        fingerprint,
+                    )
+                    status = await conn.execute(
+                        """
+                        INSERT INTO battle_reports (
+                            guild_id, message_id, attachment_id, player_id,
+                            player_name, own_losses, enemy_kills
+                        )
+                        SELECT $1, $2, $3, $4, $5, $6, $7
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM battle_reports
+                            WHERE guild_id = $1 AND player_id = $4
+                              AND own_losses = $6 AND enemy_kills = $7
+                        )
+                        ON CONFLICT (guild_id, message_id, attachment_id) DO NOTHING
+                        """,
+                        *values,
+                    )
+                    return status == "INSERT 0 1"
         return await asyncio.to_thread(self._record_sqlite, values)
 
     def _record_sqlite(self, values: tuple) -> bool:
         with self._connect_sqlite() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            duplicate = conn.execute(
+                """
+                SELECT 1 FROM battle_reports
+                WHERE guild_id = ? AND player_id = ?
+                  AND own_losses = ? AND enemy_kills = ?
+                LIMIT 1
+                """,
+                (values[0], values[3], values[5], values[6]),
+            ).fetchone()
+            if duplicate is not None:
+                return False
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO battle_reports (
@@ -1562,6 +1592,52 @@ class StatsStore:
         return await asyncio.to_thread(
             self._get_player_stats_sqlite, guild_id, player_id, since_days
         )
+
+    async def get_alliance_stats(
+        self, guild_id: int, since_days: Optional[int] = None
+    ) -> PlayerStats:
+        """Aggregate every player's reports on one Discord server."""
+        if self.pool is not None:
+            row = await self.pool.fetchrow(
+                """
+                SELECT COUNT(*) AS report_count,
+                       COALESCE(SUM(own_losses), 0) AS total_losses,
+                       COALESCE(SUM(enemy_kills), 0) AS total_kills
+                FROM battle_reports
+                WHERE guild_id = $1
+                  AND ($2::integer IS NULL OR created_at >= NOW() - ($2 * INTERVAL '1 day'))
+                """,
+                guild_id,
+                since_days,
+            )
+            return PlayerStats(
+                report_count=int(row["report_count"]),
+                total_losses=int(row["total_losses"]),
+                total_kills=int(row["total_kills"]),
+            )
+        return await asyncio.to_thread(
+            self._get_alliance_stats_sqlite, guild_id, since_days
+        )
+
+    def _get_alliance_stats_sqlite(
+        self, guild_id: int, since_days: Optional[int]
+    ) -> PlayerStats:
+        with self._connect_sqlite() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(own_losses), 0),
+                       COALESCE(SUM(enemy_kills), 0)
+                FROM battle_reports
+                WHERE guild_id = ?
+                  AND (? IS NULL OR created_at >= datetime('now', ?))
+                """,
+                (
+                    guild_id,
+                    since_days,
+                    f"-{since_days} days" if since_days is not None else None,
+                ),
+            ).fetchone()
+        return PlayerStats(int(row[0]), int(row[1]), int(row[2]))
 
     def _get_player_stats_sqlite(
         self, guild_id: int, player_id: int, since_days: Optional[int]
@@ -1735,6 +1811,41 @@ def create_discord_client():
             )
 
     @command_tree.command(
+        name="stats-alliance", description="Zobrazí spoločné štatistiky celej aliancie"
+    )
+    @discord.app_commands.describe(obdobie="Obdobie, za ktoré chceš štatistiky")
+    @discord.app_commands.choices(obdobie=period_choices)
+    async def stats_alliance_command(
+        interaction: discord.Interaction,
+        obdobie: discord.app_commands.Choice[str] | None = None,
+    ):
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Tento príkaz je dostupný iba na serveri.", ephemeral=True
+            )
+            return
+
+        await stats_ready.wait()
+        period_key = obdobie.value if obdobie is not None else "all"
+        period_label, since_days = STATS_PERIODS[period_key]
+        try:
+            stats = await stats_store.get_alliance_stats(
+                interaction.guild_id, since_days
+            )
+            await interaction.response.send_message(
+                format_player_stats("celej aliancie", stats, period_label)
+            )
+        except Exception as exc:
+            print(
+                f"[GGE] Alliance stats read error: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            await interaction.response.send_message(
+                "Štatistiky aliancie sa momentálne nepodarilo načítať.",
+                ephemeral=True,
+            )
+
+    @command_tree.command(
         name="stats-reset", description="Vymaže štatistiky vybraného hráča (iba admin)"
     )
     @discord.app_commands.default_permissions(administrator=True)
@@ -1848,7 +1959,7 @@ def create_discord_client():
                 if was_counted:
                     reply += "\n✅ Report bol započítaný. Svoje súčty zobrazíš cez `/stats`."
                 else:
-                    reply += "\nℹ️ Tento report už bol v štatistikách započítaný."
+                    reply += "\nℹ️ Tento report už máš raz započítaný."
                 await message.reply(reply, mention_author=False)
             except discord.HTTPException as exc:
                 print(f"[GGE] Failed to send Discord reply: {exc}", file=sys.stderr)
