@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sqlite3
 import sys
 import unicodedata
 from dataclasses import dataclass
@@ -38,6 +39,11 @@ try:
     import discord
 except ImportError:  # Lets the OCR functions still be imported/tested without discord.py.
     discord = None
+
+try:
+    import asyncpg
+except ImportError:  # SQLite remains available for local development/tests.
+    asyncpg = None
 
 
 # =============================================================================
@@ -72,6 +78,12 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 # Set GGE_DEBUG=1 in Railway Variables to see why a screenshot was rejected.
 DEBUG = os.getenv("GGE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+# Railway injects DATABASE_URL when a PostgreSQL service is connected. Without
+# it the bot falls back to SQLite (use a Railway Volume for persistence).
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+STATS_DB_PATH = os.getenv("STATS_DB_PATH", "battle_stats.sqlite3").strip()
+STATS_COMMAND = os.getenv("STATS_COMMAND", "!stats").strip().lower()
 
 def _debug(message: str) -> None:
     if DEBUG:
@@ -137,6 +149,13 @@ class BattleResult:
     defender_loss: int
     defender_total: int
     confidence: float
+
+
+@dataclass(frozen=True)
+class PlayerStats:
+    report_count: int
+    total_losses: int
+    total_kills: int
 
 
 # =============================================================================
@@ -1391,6 +1410,176 @@ def format_reply(result: BattleResult) -> str:
 
 
 # =============================================================================
+# PERSISTENT PLAYER STATISTICS
+# =============================================================================
+
+
+class StatsStore:
+    """PostgreSQL on Railway, with a lightweight SQLite fallback."""
+
+    def __init__(self, database_url: str = "", sqlite_path: str = STATS_DB_PATH):
+        self.database_url = database_url
+        self.sqlite_path = Path(sqlite_path)
+        self.pool = None
+
+    @property
+    def backend_name(self) -> str:
+        return "PostgreSQL" if self.database_url else f"SQLite ({self.sqlite_path})"
+
+    async def initialize(self) -> None:
+        if self.database_url:
+            if asyncpg is None:
+                raise RuntimeError("DATABASE_URL is set, but asyncpg is not installed")
+            self.pool = await asyncpg.create_pool(self.database_url, min_size=1, max_size=5)
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS battle_reports (
+                        id BIGSERIAL PRIMARY KEY,
+                        guild_id BIGINT NOT NULL,
+                        message_id BIGINT NOT NULL,
+                        attachment_id BIGINT NOT NULL,
+                        player_id BIGINT NOT NULL,
+                        player_name TEXT NOT NULL,
+                        own_losses BIGINT NOT NULL CHECK (own_losses >= 0),
+                        enemy_kills BIGINT NOT NULL CHECK (enemy_kills >= 0),
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (guild_id, message_id, attachment_id)
+                    )
+                    """
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS battle_reports_player_idx "
+                    "ON battle_reports (guild_id, player_id)"
+                )
+            return
+
+        await asyncio.to_thread(self._initialize_sqlite)
+
+    def _connect_sqlite(self):
+        self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.sqlite_path, timeout=30)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
+    def _initialize_sqlite(self) -> None:
+        with self._connect_sqlite() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS battle_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    attachment_id INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    player_name TEXT NOT NULL,
+                    own_losses INTEGER NOT NULL CHECK (own_losses >= 0),
+                    enemy_kills INTEGER NOT NULL CHECK (enemy_kills >= 0),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (guild_id, message_id, attachment_id)
+                );
+                CREATE INDEX IF NOT EXISTS battle_reports_player_idx
+                    ON battle_reports (guild_id, player_id);
+                """
+            )
+
+    async def record_battle(
+        self,
+        *,
+        guild_id: int,
+        message_id: int,
+        attachment_id: int,
+        player_id: int,
+        player_name: str,
+        result: BattleResult,
+    ) -> bool:
+        """Store a report once. Returns False when it was already counted."""
+        values = (
+            guild_id,
+            message_id,
+            attachment_id,
+            player_id,
+            player_name,
+            result.attacker_loss,
+            result.defender_loss,
+        )
+        if self.pool is not None:
+            status = await self.pool.execute(
+                """
+                INSERT INTO battle_reports (
+                    guild_id, message_id, attachment_id, player_id, player_name,
+                    own_losses, enemy_kills
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (guild_id, message_id, attachment_id) DO NOTHING
+                """,
+                *values,
+            )
+            return status == "INSERT 0 1"
+        return await asyncio.to_thread(self._record_sqlite, values)
+
+    def _record_sqlite(self, values: tuple) -> bool:
+        with self._connect_sqlite() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO battle_reports (
+                    guild_id, message_id, attachment_id, player_id, player_name,
+                    own_losses, enemy_kills
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            return cursor.rowcount == 1
+
+    async def get_player_stats(self, guild_id: int, player_id: int) -> PlayerStats:
+        if self.pool is not None:
+            row = await self.pool.fetchrow(
+                """
+                SELECT COUNT(*) AS report_count,
+                       COALESCE(SUM(own_losses), 0) AS total_losses,
+                       COALESCE(SUM(enemy_kills), 0) AS total_kills
+                FROM battle_reports
+                WHERE guild_id = $1 AND player_id = $2
+                """,
+                guild_id,
+                player_id,
+            )
+            return PlayerStats(
+                report_count=int(row["report_count"]),
+                total_losses=int(row["total_losses"]),
+                total_kills=int(row["total_kills"]),
+            )
+        return await asyncio.to_thread(self._get_player_stats_sqlite, guild_id, player_id)
+
+    def _get_player_stats_sqlite(self, guild_id: int, player_id: int) -> PlayerStats:
+        with self._connect_sqlite() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(own_losses), 0),
+                       COALESCE(SUM(enemy_kills), 0)
+                FROM battle_reports
+                WHERE guild_id = ? AND player_id = ?
+                """,
+                (guild_id, player_id),
+            ).fetchone()
+        return PlayerStats(int(row[0]), int(row[1]), int(row[2]))
+
+
+def format_player_stats(player_name: str, stats: PlayerStats) -> str:
+    if stats.report_count == 0:
+        return f"📊 **{player_name}** zatiaľ nemá uložený žiadny report."
+
+    weighted_ratio = format_battle_ratio(stats.total_losses, stats.total_kills)
+    return (
+        f"📊 **Štatistiky hráča {player_name}**\n"
+        f"🧾 **Reporty:** `{stats.report_count:,}`\n"
+        f"💀 **Celkové straty:** `{stats.total_losses:,}`\n"
+        f"⚔️ **Zabití nepriatelia:** `{stats.total_kills:,}`\n"
+        f"📈 **Priemerné ratio:** `{weighted_ratio}`"
+    ).replace(",", " ")
+
+
+# =============================================================================
 # DISCORD BOT
 # =============================================================================
 
@@ -1443,10 +1632,16 @@ def create_discord_client():
     intents.message_content = True
 
     client = discord.Client(intents=intents)
+    stats_store = StatsStore(DATABASE_URL, STATS_DB_PATH)
+    stats_ready = asyncio.Event()
 
     @client.event
     async def on_ready():
+        if not stats_ready.is_set():
+            await stats_store.initialize()
+            stats_ready.set()
         print(f"[GGE] Logged in as {client.user} (ID: {client.user.id})")
+        print(f"[GGE] Statistics storage: {stats_store.backend_name}")
         print("[GGE] Robust OCR ready. Waiting for Goodgame Empire report screenshots...")
 
     @client.event
@@ -1455,6 +1650,24 @@ def create_discord_client():
             return
 
         if ALLOWED_CHANNEL_IDS and message.channel.id not in ALLOWED_CHANNEL_IDS:
+            return
+
+        guild_id = message.guild.id if message.guild is not None else 0
+        content = (message.content or "").strip().lower()
+        if content == STATS_COMMAND:
+            await stats_ready.wait()
+            try:
+                stats = await stats_store.get_player_stats(guild_id, message.author.id)
+                await message.reply(
+                    format_player_stats(message.author.display_name, stats),
+                    mention_author=False,
+                )
+            except Exception as exc:
+                print(f"[GGE] Stats read error: {type(exc).__name__}: {exc}", file=sys.stderr)
+                await message.reply(
+                    "Štatistiky sa momentálne nepodarilo načítať.",
+                    mention_author=False,
+                )
             return
 
         attachments = [
@@ -1475,9 +1688,32 @@ def create_discord_client():
 
             any_success = True
             try:
-                await message.reply(format_reply(result), mention_author=False)
+                await stats_ready.wait()
+                was_counted = await stats_store.record_battle(
+                    guild_id=guild_id,
+                    message_id=message.id,
+                    attachment_id=attachment.id,
+                    player_id=message.author.id,
+                    player_name=message.author.display_name,
+                    result=result,
+                )
+                reply = format_reply(result)
+                if was_counted:
+                    reply += f"\n✅ Report bol započítaný. Svoje súčty zobrazíš cez `{STATS_COMMAND}`."
+                else:
+                    reply += "\nℹ️ Tento report už bol v štatistikách započítaný."
+                await message.reply(reply, mention_author=False)
             except discord.HTTPException as exc:
                 print(f"[GGE] Failed to send Discord reply: {exc}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[GGE] Stats write error: {type(exc).__name__}: {exc}", file=sys.stderr)
+                try:
+                    await message.reply(
+                        format_reply(result) + "\n⚠️ Report sa nepodarilo uložiť do štatistík.",
+                        mention_author=False,
+                    )
+                except discord.HTTPException:
+                    pass
 
         if REPLY_ON_FAILURE and not any_success:
             try:
