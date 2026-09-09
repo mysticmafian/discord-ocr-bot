@@ -38,6 +38,27 @@ class StatsStoreTests(unittest.TestCase):
             stats = asyncio.run(scenario())
             self.assertEqual(stats, PlayerStats(2, 150, 400))
 
+    def test_period_filter_and_admin_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
+
+            async def scenario():
+                await store.initialize()
+                result = BattleResult(25, 75, 100, 1.0)
+                await store.record_battle(
+                    guild_id=1, message_id=20, attachment_id=200,
+                    player_id=8, player_name="Admin target", result=result,
+                )
+                recent = await store.get_player_stats(1, 8, since_days=1)
+                deleted = await store.reset_player_stats(1, 8, since_days=7)
+                remaining = await store.get_player_stats(1, 8)
+                return recent, deleted, remaining
+
+            recent, deleted, remaining = asyncio.run(scenario())
+            self.assertEqual(recent, PlayerStats(1, 25, 75))
+            self.assertEqual(deleted, 1)
+            self.assertEqual(remaining, PlayerStats(0, 0, 0))
+
     def test_stats_format_uses_weighted_ratio(self):
         text = format_player_stats("Knight", PlayerStats(2, 150, 400))
         self.assertIn("Celkové straty:** `150`", text)

@@ -85,6 +85,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 STATS_DB_PATH = os.getenv("STATS_DB_PATH", "battle_stats.sqlite3").strip()
 STATS_COMMAND = os.getenv("STATS_COMMAND", "!stats").strip().lower()
 
+STATS_PERIODS = {
+    "1d": ("za posledný 1 deň", 1),
+    "7d": ("za posledných 7 dní", 7),
+    "all": ("za celé obdobie", None),
+}
+
 def _debug(message: str) -> None:
     if DEBUG:
         print(f"[GGE][DEBUG] {message}")
@@ -1531,7 +1537,9 @@ class StatsStore:
             )
             return cursor.rowcount == 1
 
-    async def get_player_stats(self, guild_id: int, player_id: int) -> PlayerStats:
+    async def get_player_stats(
+        self, guild_id: int, player_id: int, since_days: Optional[int] = None
+    ) -> PlayerStats:
         if self.pool is not None:
             row = await self.pool.fetchrow(
                 """
@@ -1540,18 +1548,24 @@ class StatsStore:
                        COALESCE(SUM(enemy_kills), 0) AS total_kills
                 FROM battle_reports
                 WHERE guild_id = $1 AND player_id = $2
+                  AND ($3::integer IS NULL OR created_at >= NOW() - ($3 * INTERVAL '1 day'))
                 """,
                 guild_id,
                 player_id,
+                since_days,
             )
             return PlayerStats(
                 report_count=int(row["report_count"]),
                 total_losses=int(row["total_losses"]),
                 total_kills=int(row["total_kills"]),
             )
-        return await asyncio.to_thread(self._get_player_stats_sqlite, guild_id, player_id)
+        return await asyncio.to_thread(
+            self._get_player_stats_sqlite, guild_id, player_id, since_days
+        )
 
-    def _get_player_stats_sqlite(self, guild_id: int, player_id: int) -> PlayerStats:
+    def _get_player_stats_sqlite(
+        self, guild_id: int, player_id: int, since_days: Optional[int]
+    ) -> PlayerStats:
         with self._connect_sqlite() as conn:
             row = conn.execute(
                 """
@@ -1559,19 +1573,66 @@ class StatsStore:
                        COALESCE(SUM(enemy_kills), 0)
                 FROM battle_reports
                 WHERE guild_id = ? AND player_id = ?
+                  AND (? IS NULL OR created_at >= datetime('now', ?))
                 """,
-                (guild_id, player_id),
+                (
+                    guild_id,
+                    player_id,
+                    since_days,
+                    f"-{since_days} days" if since_days is not None else None,
+                ),
             ).fetchone()
         return PlayerStats(int(row[0]), int(row[1]), int(row[2]))
 
+    async def reset_player_stats(
+        self, guild_id: int, player_id: int, since_days: Optional[int] = None
+    ) -> int:
+        """Delete a player's reports in the selected period and return the count."""
+        if self.pool is not None:
+            status = await self.pool.execute(
+                """
+                DELETE FROM battle_reports
+                WHERE guild_id = $1 AND player_id = $2
+                  AND ($3::integer IS NULL OR created_at >= NOW() - ($3 * INTERVAL '1 day'))
+                """,
+                guild_id,
+                player_id,
+                since_days,
+            )
+            return int(status.rsplit(" ", 1)[-1])
+        return await asyncio.to_thread(
+            self._reset_player_stats_sqlite, guild_id, player_id, since_days
+        )
 
-def format_player_stats(player_name: str, stats: PlayerStats) -> str:
+    def _reset_player_stats_sqlite(
+        self, guild_id: int, player_id: int, since_days: Optional[int]
+    ) -> int:
+        with self._connect_sqlite() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM battle_reports
+                WHERE guild_id = ? AND player_id = ?
+                  AND (? IS NULL OR created_at >= datetime('now', ?))
+                """,
+                (
+                    guild_id,
+                    player_id,
+                    since_days,
+                    f"-{since_days} days" if since_days is not None else None,
+                ),
+            )
+            return cursor.rowcount
+
+
+def format_player_stats(
+    player_name: str, stats: PlayerStats, period_label: str = "za celé obdobie"
+) -> str:
     if stats.report_count == 0:
-        return f"📊 **{player_name}** zatiaľ nemá uložený žiadny report."
+        return f"📊 **{player_name}** nemá {period_label} uložený žiadny report."
 
     weighted_ratio = format_battle_ratio(stats.total_losses, stats.total_kills)
     return (
-        f"📊 **Štatistiky hráča {player_name}**\n"
+        f"📊 **Štatistiky hráča {player_name}** ({period_label})\n"
         f"🧾 **Reporty:** `{stats.report_count:,}`\n"
         f"💀 **Celkové straty:** `{stats.total_losses:,}`\n"
         f"⚔️ **Zabití nepriatelia:** `{stats.total_kills:,}`\n"
@@ -1632,14 +1693,100 @@ def create_discord_client():
     intents.message_content = True
 
     client = discord.Client(intents=intents)
+    command_tree = discord.app_commands.CommandTree(client)
     stats_store = StatsStore(DATABASE_URL, STATS_DB_PATH)
     stats_ready = asyncio.Event()
+    commands_synced = False
+
+    period_choices = [
+        discord.app_commands.Choice(name="1 deň", value="1d"),
+        discord.app_commands.Choice(name="7 dní", value="7d"),
+        discord.app_commands.Choice(name="Celé obdobie", value="all"),
+    ]
+
+    @command_tree.command(name="stats", description="Zobrazí tvoje bojové štatistiky")
+    @discord.app_commands.describe(obdobie="Obdobie, za ktoré chceš štatistiky")
+    @discord.app_commands.choices(obdobie=period_choices)
+    async def stats_command(
+        interaction: discord.Interaction,
+        obdobie: discord.app_commands.Choice[str] | None = None,
+    ):
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Tento príkaz je dostupný iba na serveri.", ephemeral=True
+            )
+            return
+
+        await stats_ready.wait()
+        period_key = obdobie.value if obdobie is not None else "all"
+        period_label, since_days = STATS_PERIODS[period_key]
+        try:
+            stats = await stats_store.get_player_stats(
+                interaction.guild_id, interaction.user.id, since_days
+            )
+            display_name = getattr(interaction.user, "display_name", interaction.user.name)
+            await interaction.response.send_message(
+                format_player_stats(display_name, stats, period_label)
+            )
+        except Exception as exc:
+            print(f"[GGE] Stats read error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            await interaction.response.send_message(
+                "Štatistiky sa momentálne nepodarilo načítať.", ephemeral=True
+            )
+
+    @command_tree.command(
+        name="stats-reset", description="Vymaže štatistiky vybraného hráča (iba admin)"
+    )
+    @discord.app_commands.default_permissions(administrator=True)
+    @discord.app_commands.describe(
+        hrac="Hráč, ktorému chceš vymazať štatistiky",
+        obdobie="Obdobie, ktoré chceš vymazať",
+    )
+    @discord.app_commands.choices(obdobie=period_choices)
+    async def stats_reset_command(
+        interaction: discord.Interaction,
+        hrac: discord.Member,
+        obdobie: discord.app_commands.Choice[str] | None = None,
+    ):
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Tento príkaz je dostupný iba na serveri.", ephemeral=True
+            )
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "Na tento príkaz potrebuješ oprávnenie Administrátor.", ephemeral=True
+            )
+            return
+
+        await stats_ready.wait()
+        period_key = obdobie.value if obdobie is not None else "all"
+        period_label, since_days = STATS_PERIODS[period_key]
+        try:
+            deleted = await stats_store.reset_player_stats(
+                interaction.guild_id, hrac.id, since_days
+            )
+            await interaction.response.send_message(
+                f"🗑️ Vymazané reporty hráča **{hrac.display_name}** "
+                f"({period_label}): `{deleted}`.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            print(f"[GGE] Stats reset error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            await interaction.response.send_message(
+                "Štatistiky sa nepodarilo vymazať.", ephemeral=True
+            )
 
     @client.event
     async def on_ready():
+        nonlocal commands_synced
         if not stats_ready.is_set():
             await stats_store.initialize()
             stats_ready.set()
+        if not commands_synced:
+            synced = await command_tree.sync()
+            commands_synced = True
+            print(f"[GGE] Synced {len(synced)} global slash commands")
         print(f"[GGE] Logged in as {client.user} (ID: {client.user.id})")
         print(f"[GGE] Statistics storage: {stats_store.backend_name}")
         print("[GGE] Robust OCR ready. Waiting for Goodgame Empire report screenshots...")
@@ -1699,7 +1846,7 @@ def create_discord_client():
                 )
                 reply = format_reply(result)
                 if was_counted:
-                    reply += f"\n✅ Report bol započítaný. Svoje súčty zobrazíš cez `{STATS_COMMAND}`."
+                    reply += "\n✅ Report bol započítaný. Svoje súčty zobrazíš cez `/stats`."
                 else:
                     reply += "\nℹ️ Tento report už bol v štatistikách započítaný."
                 await message.reply(reply, mention_author=False)
