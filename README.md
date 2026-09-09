@@ -32,6 +32,10 @@ priamo na správu s reportom textom `!release-report`. Bot tým report vymaže z
 štatistík hráča aj aliancie a rovnaký report sa dá znova započítať správnemu
 hráčovi.
 
+Príkaz `!blacklist` funguje tiež ako admin odpoveď na botovu hlášku alebo priamo
+na správu s reportom. Bot report vymaže zo štatistík a jeho hodnoty natrvalo
+zablokuje, takže rovnaký report si už nikto nezapočíta.
+
 Príkaz `/stats-alliance` s rovnakým výberom obdobia zobrazí spoločný súhrn
 všetkých hráčov na Discord serveri.
 
@@ -55,4 +59,6 @@ Voliteľné premenné:
 - `STATS_COMMAND` – voliteľný starší textový príkaz, predvolene `!stats`.
 - `RELEASE_REPORT_COMMAND` – admin príkaz na uvoľnenie reportu, predvolene
   `!release-report`.
+- `BLACKLIST_REPORT_COMMAND` – admin príkaz na trvalé zablokovanie reportu,
+  predvolene `!blacklist`.
 - `GGE_DEBUG=1` – podrobné OCR logy.

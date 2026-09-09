@@ -85,6 +85,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 STATS_DB_PATH = os.getenv("STATS_DB_PATH", "battle_stats.sqlite3").strip()
 STATS_COMMAND = os.getenv("STATS_COMMAND", "!stats").strip().lower()
 RELEASE_REPORT_COMMAND = os.getenv("RELEASE_REPORT_COMMAND", "!release-report").strip().lower()
+BLACKLIST_REPORT_COMMAND = os.getenv("BLACKLIST_REPORT_COMMAND", "!blacklist").strip().lower()
 
 STATS_PERIODS = {
     "1d": ("za posledný 1 deň", 1),
@@ -178,6 +179,13 @@ class RecordBattleResult:
     counted: bool
     duplicate_player_id: Optional[int] = None
     duplicate_player_name: Optional[str] = None
+    blacklisted: bool = False
+
+
+@dataclass(frozen=True)
+class BlacklistReportResult:
+    deleted_reports: int
+    blacklisted_reports: int
 
 
 # =============================================================================
@@ -1537,6 +1545,21 @@ class StatsStore:
                     """
                 )
                 await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS battle_report_blacklist (
+                        id BIGSERIAL PRIMARY KEY,
+                        guild_id BIGINT NOT NULL,
+                        own_losses BIGINT NOT NULL CHECK (own_losses >= 0),
+                        enemy_kills BIGINT NOT NULL CHECK (enemy_kills >= 0),
+                        source_message_id BIGINT,
+                        blacklisted_by_id BIGINT,
+                        blacklisted_by_name TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (guild_id, own_losses, enemy_kills)
+                    )
+                    """
+                )
+                await conn.execute(
                     "CREATE INDEX IF NOT EXISTS battle_reports_player_idx "
                     "ON battle_reports (guild_id, player_id)"
                 )
@@ -1566,6 +1589,17 @@ class StatsStore:
                     enemy_kills INTEGER NOT NULL CHECK (enemy_kills >= 0),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (guild_id, message_id, attachment_id)
+                );
+                CREATE TABLE IF NOT EXISTS battle_report_blacklist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    own_losses INTEGER NOT NULL CHECK (own_losses >= 0),
+                    enemy_kills INTEGER NOT NULL CHECK (enemy_kills >= 0),
+                    source_message_id INTEGER,
+                    blacklisted_by_id INTEGER,
+                    blacklisted_by_name TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (guild_id, own_losses, enemy_kills)
                 );
                 CREATE INDEX IF NOT EXISTS battle_reports_player_idx
                     ON battle_reports (guild_id, player_id);
@@ -1605,6 +1639,18 @@ class StatsStore:
                         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                         fingerprint,
                     )
+                    blacklisted = await conn.fetchrow(
+                        """
+                        SELECT 1 FROM battle_report_blacklist
+                        WHERE guild_id = $1 AND own_losses = $2 AND enemy_kills = $3
+                        LIMIT 1
+                        """,
+                        guild_id,
+                        result.attacker_loss,
+                        result.defender_loss,
+                    )
+                    if blacklisted is not None:
+                        return RecordBattleResult(False, blacklisted=True)
                     duplicate = await conn.fetchrow(
                         """
                         SELECT player_id, player_name FROM battle_reports
@@ -1640,6 +1686,16 @@ class StatsStore:
     def _record_sqlite(self, values: tuple) -> RecordBattleResult:
         with self._connect_sqlite() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            blacklisted = conn.execute(
+                """
+                SELECT 1 FROM battle_report_blacklist
+                WHERE guild_id = ? AND own_losses = ? AND enemy_kills = ?
+                LIMIT 1
+                """,
+                (values[0], values[5], values[6]),
+            ).fetchone()
+            if blacklisted is not None:
+                return RecordBattleResult(False, blacklisted=True)
             duplicate = conn.execute(
                 """
                 SELECT player_id, player_name FROM battle_reports
@@ -1861,6 +1917,107 @@ class StatsStore:
                 (guild_id, message_id),
             )
             return cursor.rowcount
+
+    async def blacklist_report(
+        self,
+        guild_id: int,
+        message_id: int,
+        admin_id: int,
+        admin_name: str,
+    ) -> BlacklistReportResult:
+        """Blacklist reports from one message and remove them from stats."""
+        if self.pool is not None:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    rows = await conn.fetch(
+                        """
+                        SELECT DISTINCT own_losses, enemy_kills
+                        FROM battle_reports
+                        WHERE guild_id = $1 AND message_id = $2
+                        """,
+                        guild_id,
+                        message_id,
+                    )
+                    blacklisted_reports = 0
+                    for row in rows:
+                        status = await conn.execute(
+                            """
+                            INSERT INTO battle_report_blacklist (
+                                guild_id, own_losses, enemy_kills,
+                                source_message_id, blacklisted_by_id, blacklisted_by_name
+                            ) VALUES ($1, $2, $3, $4, $5, $6)
+                            ON CONFLICT (guild_id, own_losses, enemy_kills) DO NOTHING
+                            """,
+                            guild_id,
+                            int(row["own_losses"]),
+                            int(row["enemy_kills"]),
+                            message_id,
+                            admin_id,
+                            admin_name,
+                        )
+                        if status == "INSERT 0 1":
+                            blacklisted_reports += 1
+
+                    status = await conn.execute(
+                        """
+                        DELETE FROM battle_reports
+                        WHERE guild_id = $1 AND message_id = $2
+                        """,
+                        guild_id,
+                        message_id,
+                    )
+                    deleted_reports = int(status.rsplit(" ", 1)[-1])
+                    return BlacklistReportResult(deleted_reports, blacklisted_reports)
+        return await asyncio.to_thread(
+            self._blacklist_report_sqlite, guild_id, message_id, admin_id, admin_name
+        )
+
+    def _blacklist_report_sqlite(
+        self,
+        guild_id: int,
+        message_id: int,
+        admin_id: int,
+        admin_name: str,
+    ) -> BlacklistReportResult:
+        with self._connect_sqlite() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT DISTINCT own_losses, enemy_kills
+                FROM battle_reports
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (guild_id, message_id),
+            ).fetchall()
+
+            blacklisted_reports = 0
+            for own_losses, enemy_kills in rows:
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO battle_report_blacklist (
+                        guild_id, own_losses, enemy_kills,
+                        source_message_id, blacklisted_by_id, blacklisted_by_name
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        guild_id,
+                        int(own_losses),
+                        int(enemy_kills),
+                        message_id,
+                        admin_id,
+                        admin_name,
+                    ),
+                )
+                blacklisted_reports += cursor.rowcount
+
+            cursor = conn.execute(
+                """
+                DELETE FROM battle_reports
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (guild_id, message_id),
+            )
+            return BlacklistReportResult(cursor.rowcount, blacklisted_reports)
 
     async def reset_player_stats(
         self, guild_id: int, player_id: int, since_days: Optional[int] = None
@@ -2191,6 +2348,62 @@ def create_discord_client():
 
         guild_id = message.guild.id if message.guild is not None else 0
         content = (message.content or "").strip().lower()
+        if content == BLACKLIST_REPORT_COMMAND:
+            if message.guild is None:
+                return
+            if not getattr(message.author.guild_permissions, "administrator", False):
+                await message.reply(
+                    "Na tento príkaz potrebuješ oprávnenie Administrátor.",
+                    mention_author=False,
+                )
+                return
+
+            target_message = await _fetch_referenced_message(message)
+            if target_message is None:
+                await message.reply(
+                    f"Použi `{BLACKLIST_REPORT_COMMAND}` ako odpoveď na botovu hlášku "
+                    "alebo priamo na správu s reportom.",
+                    mention_author=False,
+                )
+                return
+
+            original_message_id = target_message.id
+            if (
+                client.user is not None
+                and target_message.author.id == client.user.id
+                and target_message.reference is not None
+                and target_message.reference.message_id is not None
+            ):
+                original_message_id = target_message.reference.message_id
+
+            await stats_ready.wait()
+            try:
+                result = await stats_store.blacklist_report(
+                    guild_id,
+                    original_message_id,
+                    message.author.id,
+                    message.author.display_name,
+                )
+                if result.deleted_reports or result.blacklisted_reports:
+                    await message.reply(
+                        f"⛔ Report je na blackliste. Vymazané záznamy: "
+                        f"`{result.deleted_reports}`, nové blokácie: "
+                        f"`{result.blacklisted_reports}`.",
+                        mention_author=False,
+                    )
+                else:
+                    await message.reply(
+                        "Nenašiel som k tejto správe žiadny započítaný report na blacklist.",
+                        mention_author=False,
+                    )
+            except Exception as exc:
+                print(f"[GGE] Blacklist report error: {type(exc).__name__}: {exc}", file=sys.stderr)
+                await message.reply(
+                    "Report sa momentálne nepodarilo pridať na blacklist.",
+                    mention_author=False,
+                )
+            return
+
         if content == RELEASE_REPORT_COMMAND:
             if message.guild is None:
                 return
@@ -2294,6 +2507,8 @@ def create_discord_client():
                 reply = format_reply(result)
                 if record_result.counted:
                     reply += "\n✅ Report bol započítaný. Svoje súčty zobrazíš cez `/stats`."
+                elif record_result.blacklisted:
+                    reply += "\n⛔ Tento report je na blackliste a nebude započítaný."
                 elif record_result.duplicate_player_id == message.author.id:
                     reply += "\nℹ️ Tento report už máš raz započítaný."
                 elif record_result.duplicate_player_name:
