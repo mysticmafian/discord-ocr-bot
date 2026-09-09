@@ -16,8 +16,9 @@ Hráč si svoje štatistiky zobrazí slash príkazom `/stats` a vyberie si obdob
 Discord správy nezapočíta dvakrát.
 
 Bot navyše porovnáva vlastné straty a zabitých nepriateľov s predchádzajúcimi
-reportmi daného hráča. Ak hráč pošle rovnaký report ako novú prílohu, bot znovu
-zobrazí ratio a percentá, ale report druhýkrát do štatistík nepridá.
+reportmi na Discord serveri. Ak hráč pošle rovnaký report ako novú prílohu, bot
+znovu zobrazí ratio a percentá, ale report druhýkrát do štatistík nepridá. Keď
+už rovnaký report nahral iný hráč, bot doplní aj jeho meno.
 
 Administrátor môže cez `/stats-reset` vybrať hráča aj obdobie, ktorého uložené
 reporty sa majú vymazať. Bot oprávnenie Administrátor kontroluje aj pri vykonaní

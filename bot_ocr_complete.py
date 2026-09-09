@@ -164,6 +164,13 @@ class PlayerStats:
     total_kills: int
 
 
+@dataclass(frozen=True)
+class RecordBattleResult:
+    counted: bool
+    duplicate_player_id: Optional[int] = None
+    duplicate_player_name: Optional[str] = None
+
+
 # =============================================================================
 # TEXT / ROLE HELPERS
 # =============================================================================
@@ -1499,11 +1506,11 @@ class StatsStore:
         player_id: int,
         player_name: str,
         result: BattleResult,
-    ) -> bool:
-        """Store a report once per player and loss pair.
+    ) -> RecordBattleResult:
+        """Store a report once per guild and loss pair.
 
         A different Discord upload with the same own/enemy losses is treated as
-        the same battle for that player. The PostgreSQL advisory lock makes the
+        the same battle for the alliance. The PostgreSQL advisory lock makes the
         check atomic even if two images finish OCR at the same time.
         """
         values = (
@@ -1518,44 +1525,57 @@ class StatsStore:
         if self.pool is not None:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    fingerprint = f"{guild_id}:{player_id}:{result.attacker_loss}:{result.defender_loss}"
+                    fingerprint = f"{guild_id}:{result.attacker_loss}:{result.defender_loss}"
                     await conn.execute(
                         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                         fingerprint,
                     )
+                    duplicate = await conn.fetchrow(
+                        """
+                        SELECT player_id, player_name FROM battle_reports
+                        WHERE guild_id = $1 AND own_losses = $2 AND enemy_kills = $3
+                        ORDER BY created_at ASC, id ASC
+                        LIMIT 1
+                        """,
+                        guild_id,
+                        result.attacker_loss,
+                        result.defender_loss,
+                    )
+                    if duplicate is not None:
+                        return RecordBattleResult(
+                            False,
+                            int(duplicate["player_id"]),
+                            duplicate["player_name"],
+                        )
                     status = await conn.execute(
                         """
                         INSERT INTO battle_reports (
                             guild_id, message_id, attachment_id, player_id,
                             player_name, own_losses, enemy_kills
-                        )
-                        SELECT $1, $2, $3, $4, $5, $6, $7
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM battle_reports
-                            WHERE guild_id = $1 AND player_id = $4
-                              AND own_losses = $6 AND enemy_kills = $7
-                        )
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                         ON CONFLICT (guild_id, message_id, attachment_id) DO NOTHING
                         """,
                         *values,
                     )
-                    return status == "INSERT 0 1"
+                    if status == "INSERT 0 1":
+                        return RecordBattleResult(True)
+                    return RecordBattleResult(False, player_id, player_name)
         return await asyncio.to_thread(self._record_sqlite, values)
 
-    def _record_sqlite(self, values: tuple) -> bool:
+    def _record_sqlite(self, values: tuple) -> RecordBattleResult:
         with self._connect_sqlite() as conn:
             conn.execute("BEGIN IMMEDIATE")
             duplicate = conn.execute(
                 """
-                SELECT 1 FROM battle_reports
-                WHERE guild_id = ? AND player_id = ?
-                  AND own_losses = ? AND enemy_kills = ?
+                SELECT player_id, player_name FROM battle_reports
+                WHERE guild_id = ? AND own_losses = ? AND enemy_kills = ?
+                ORDER BY created_at ASC, id ASC
                 LIMIT 1
                 """,
-                (values[0], values[3], values[5], values[6]),
+                (values[0], values[5], values[6]),
             ).fetchone()
             if duplicate is not None:
-                return False
+                return RecordBattleResult(False, int(duplicate[0]), duplicate[1])
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO battle_reports (
@@ -1565,7 +1585,9 @@ class StatsStore:
                 """,
                 values,
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount == 1:
+                return RecordBattleResult(True)
+            return RecordBattleResult(False, values[3], values[4])
 
     async def get_player_stats(
         self, guild_id: int, player_id: int, since_days: Optional[int] = None
@@ -1947,7 +1969,7 @@ def create_discord_client():
             any_success = True
             try:
                 await stats_ready.wait()
-                was_counted = await stats_store.record_battle(
+                record_result = await stats_store.record_battle(
                     guild_id=guild_id,
                     message_id=message.id,
                     attachment_id=attachment.id,
@@ -1956,10 +1978,14 @@ def create_discord_client():
                     result=result,
                 )
                 reply = format_reply(result)
-                if was_counted:
+                if record_result.counted:
                     reply += "\n✅ Report bol započítaný. Svoje súčty zobrazíš cez `/stats`."
-                else:
+                elif record_result.duplicate_player_id == message.author.id:
                     reply += "\nℹ️ Tento report už máš raz započítaný."
+                elif record_result.duplicate_player_name:
+                    reply += f"\nℹ️ Tento report už nahral: {record_result.duplicate_player_name}"
+                else:
+                    reply += "\nℹ️ Tento report už bol započítaný."
                 await message.reply(reply, mention_author=False)
             except discord.HTTPException as exc:
                 print(f"[GGE] Failed to send Discord reply: {exc}", file=sys.stderr)
