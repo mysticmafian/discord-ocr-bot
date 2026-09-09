@@ -165,6 +165,13 @@ class PlayerStats:
 
 
 @dataclass(frozen=True)
+class LeaderboardEntry:
+    player_id: int
+    player_name: str
+    stats: PlayerStats
+
+
+@dataclass(frozen=True)
 class RecordBattleResult:
     counted: bool
     duplicate_player_id: Optional[int] = None
@@ -1682,6 +1689,86 @@ class StatsStore:
             ).fetchone()
         return PlayerStats(int(row[0]), int(row[1]), int(row[2]))
 
+    async def get_leaderboard(
+        self,
+        guild_id: int,
+        since_days: Optional[int] = None,
+        limit: int = 10,
+    ) -> list[LeaderboardEntry]:
+        """Return top players ordered by enemy kills."""
+        if self.pool is not None:
+            rows = await self.pool.fetch(
+                """
+                SELECT player_id,
+                       MAX(player_name) AS player_name,
+                       COUNT(*) AS report_count,
+                       COALESCE(SUM(own_losses), 0) AS total_losses,
+                       COALESCE(SUM(enemy_kills), 0) AS total_kills
+                FROM battle_reports
+                WHERE guild_id = $1
+                  AND ($2::integer IS NULL OR created_at >= NOW() - ($2 * INTERVAL '1 day'))
+                GROUP BY player_id
+                ORDER BY total_kills DESC, total_losses ASC, report_count DESC, player_name ASC
+                LIMIT $3
+                """,
+                guild_id,
+                since_days,
+                limit,
+            )
+            return [
+                LeaderboardEntry(
+                    player_id=int(row["player_id"]),
+                    player_name=row["player_name"],
+                    stats=PlayerStats(
+                        report_count=int(row["report_count"]),
+                        total_losses=int(row["total_losses"]),
+                        total_kills=int(row["total_kills"]),
+                    ),
+                )
+                for row in rows
+            ]
+        return await asyncio.to_thread(
+            self._get_leaderboard_sqlite, guild_id, since_days, limit
+        )
+
+    def _get_leaderboard_sqlite(
+        self, guild_id: int, since_days: Optional[int], limit: int
+    ) -> list[LeaderboardEntry]:
+        with self._connect_sqlite() as conn:
+            rows = conn.execute(
+                """
+                SELECT player_id,
+                       MAX(player_name) AS player_name,
+                       COUNT(*) AS report_count,
+                       COALESCE(SUM(own_losses), 0) AS total_losses,
+                       COALESCE(SUM(enemy_kills), 0) AS total_kills
+                FROM battle_reports
+                WHERE guild_id = ?
+                  AND (? IS NULL OR created_at >= datetime('now', ?))
+                GROUP BY player_id
+                ORDER BY total_kills DESC, total_losses ASC, report_count DESC, player_name ASC
+                LIMIT ?
+                """,
+                (
+                    guild_id,
+                    since_days,
+                    f"-{since_days} days" if since_days is not None else None,
+                    limit,
+                ),
+            ).fetchall()
+        return [
+            LeaderboardEntry(
+                player_id=int(row[0]),
+                player_name=row[1],
+                stats=PlayerStats(
+                    report_count=int(row[2]),
+                    total_losses=int(row[3]),
+                    total_kills=int(row[4]),
+                ),
+            )
+            for row in rows
+        ]
+
     async def reset_player_stats(
         self, guild_id: int, player_id: int, since_days: Optional[int] = None
     ) -> int:
@@ -1736,6 +1823,25 @@ def format_player_stats(
         f"⚔️ **Zabití nepriatelia:** `{stats.total_kills:,}`\n"
         f"📈 **Priemerné ratio:** `{weighted_ratio}`"
     ).replace(",", " ")
+
+
+def format_leaderboard(
+    entries: list[LeaderboardEntry], period_label: str = "za celé obdobie"
+) -> str:
+    if not entries:
+        return f"🏆 Leaderboard je {period_label} zatiaľ prázdny."
+
+    lines = [f"🏆 **Leaderboard podľa zabitých nepriateľov** ({period_label})"]
+    for index, entry in enumerate(entries, start=1):
+        ratio = format_battle_ratio(entry.stats.total_losses, entry.stats.total_kills)
+        lines.append(
+            f"**{index}. {entry.player_name}** — "
+            f"`{entry.stats.total_kills:,}` killov, "
+            f"`{entry.stats.total_losses:,}` strát, "
+            f"ratio `{ratio}`, "
+            f"reporty `{entry.stats.report_count:,}`"
+        )
+    return "\n".join(lines).replace(",", " ")
 
 
 # =============================================================================
@@ -1865,6 +1971,41 @@ def create_discord_client():
             await interaction.response.send_message(
                 "Štatistiky aliancie sa momentálne nepodarilo načítať.",
                 ephemeral=True,
+            )
+
+    @command_tree.command(
+        name="leaderboard",
+        description="Zobrazí TOP hráčov podľa zabitých nepriateľov",
+    )
+    @discord.app_commands.describe(obdobie="Obdobie, za ktoré chceš leaderboard")
+    @discord.app_commands.choices(obdobie=period_choices)
+    async def leaderboard_command(
+        interaction: discord.Interaction,
+        obdobie: discord.app_commands.Choice[str] | None = None,
+    ):
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Tento príkaz je dostupný iba na serveri.", ephemeral=True
+            )
+            return
+
+        await stats_ready.wait()
+        period_key = obdobie.value if obdobie is not None else "all"
+        period_label, since_days = STATS_PERIODS[period_key]
+        try:
+            entries = await stats_store.get_leaderboard(
+                interaction.guild_id, since_days
+            )
+            await interaction.response.send_message(
+                format_leaderboard(entries, period_label)
+            )
+        except Exception as exc:
+            print(
+                f"[GGE] Leaderboard read error: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            await interaction.response.send_message(
+                "Leaderboard sa momentálne nepodarilo načítať.", ephemeral=True
             )
 
     @command_tree.command(

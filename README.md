@@ -27,6 +27,10 @@ príkazu.
 Príkaz `/stats-alliance` s rovnakým výberom obdobia zobrazí spoločný súhrn
 všetkých hráčov na Discord serveri.
 
+Príkaz `/leaderboard` zobrazí TOP 10 hráčov zoradených podľa počtu zabitých
+nepriateľských vojakov. Aj tu si hráč vyberá obdobie `1 deň`, `7 dní` alebo
+`Celé obdobie`.
+
 ## Railway
 
 1. Pripoj k službe Railway PostgreSQL databázu.

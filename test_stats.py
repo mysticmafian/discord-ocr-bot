@@ -7,6 +7,7 @@ from bot_ocr_complete import (
     BattleResult,
     PlayerStats,
     StatsStore,
+    format_leaderboard,
     format_player_stats,
 )
 
@@ -110,6 +111,33 @@ class StatsStoreTests(unittest.TestCase):
                 asyncio.run(scenario()), PlayerStats(2, 150, 400)
             )
 
+    def test_leaderboard_orders_players_by_enemy_kills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
+
+            async def scenario():
+                await store.initialize()
+                await store.record_battle(
+                    guild_id=1, message_id=60, attachment_id=600,
+                    player_id=21, player_name="Low",
+                    result=BattleResult(20, 90, 100, 1.0),
+                )
+                await store.record_battle(
+                    guild_id=1, message_id=61, attachment_id=601,
+                    player_id=22, player_name="High",
+                    result=BattleResult(70, 250, 300, 1.0),
+                )
+                await store.record_battle(
+                    guild_id=1, message_id=62, attachment_id=602,
+                    player_id=23, player_name="Mid",
+                    result=BattleResult(40, 150, 200, 1.0),
+                )
+                return await store.get_leaderboard(1)
+
+            entries = asyncio.run(scenario())
+            self.assertEqual([entry.player_name for entry in entries], ["High", "Mid", "Low"])
+            self.assertEqual([entry.stats.total_kills for entry in entries], [250, 150, 90])
+
     def test_period_filter_and_admin_reset(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
@@ -136,6 +164,24 @@ class StatsStoreTests(unittest.TestCase):
         self.assertIn("Celkové straty:** `150`", text)
         self.assertIn("Zabití nepriatelia:** `400`", text)
         self.assertIn("Priemerné ratio:** `1 : 2.67`", text)
+
+    def test_leaderboard_format_includes_ranking_and_kills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
+
+            async def scenario():
+                await store.initialize()
+                await store.record_battle(
+                    guild_id=1, message_id=70, attachment_id=700,
+                    player_id=31, player_name="Knight",
+                    result=BattleResult(100, 400, 500, 1.0),
+                )
+                return await store.get_leaderboard(1)
+
+            text = format_leaderboard(asyncio.run(scenario()))
+            self.assertIn("Leaderboard podľa zabitých nepriateľov", text)
+            self.assertIn("**1. Knight**", text)
+            self.assertIn("`400` killov", text)
 
 
 if __name__ == "__main__":
