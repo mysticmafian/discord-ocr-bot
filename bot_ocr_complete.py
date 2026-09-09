@@ -1843,14 +1843,10 @@ def format_leaderboard(
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines = [f"🏆 **Leaderboard podľa zabitých nepriateľov** ({period_label})"]
     for index, entry in enumerate(entries, start=1):
-        ratio = format_battle_ratio(entry.stats.total_losses, entry.stats.total_kills)
         rank = medals.get(index, f"**{index}.**")
         lines.append(
             f"\n{rank} **{compact_name(entry.player_name, 24)}**\n"
-            f"⚔️ **{pretty_number(entry.stats.total_kills)}** killov • "
-            f"💀 **{pretty_number(entry.stats.total_losses)}** strát • "
-            f"📈 **{ratio.replace(' ', '')}** • "
-            f"🧾 **{pretty_number(entry.stats.report_count)}**"
+            f"⚔️ **{pretty_number(entry.stats.total_kills)}** killov"
         )
     return "\n".join(lines)
 
