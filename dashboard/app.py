@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import html
@@ -147,14 +148,12 @@ def render_dashboard(data: dict[str, Any], period_key: str, period_label: str) -
         ("Blacklist", fmt_number(data["blacklist_count"])),
     ]
 
-    card_html = "
-".join(
+    card_html = "\n".join(
         f'<section class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></section>'
         for label, value in cards
     )
 
-    tabs = "
-".join(
+    tabs = "\n".join(
         f'<a class="tab {"active" if key == period_key else ""}" href="/?period={key}">{esc(label)}</a>'
         for key, (label, _) in PERIODS.items()
     )
@@ -173,8 +172,7 @@ def render_dashboard(data: dict[str, Any], period_key: str, period_label: str) -
             f"<td>{fmt_number(row['report_count'])}</td>"
             "</tr>"
         )
-    leaderboard_html = "
-".join(rows) or (
+    leaderboard_html = "\n".join(rows) or (
         '<tr><td colspan="6" class="empty">Zatiaľ žiadne reporty.</td></tr>'
     )
 
@@ -192,8 +190,7 @@ def render_dashboard(data: dict[str, Any], period_key: str, period_label: str) -
             f"<td>{fmt_ratio(losses, kills)}</td>"
             "</tr>"
         )
-    recent_html = "
-".join(recent_rows) or (
+    recent_html = "\n".join(recent_rows) or (
         '<tr><td colspan="5" class="empty">Zatiaľ žiadne reporty.</td></tr>'
     )
 
