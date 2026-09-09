@@ -1840,23 +1840,18 @@ def format_leaderboard(
     def pretty_number(value: int) -> str:
         return f"{value:,}".replace(",", " ")
 
-    lines = [
-        f"🏆 **Leaderboard podľa zabitých nepriateľov** ({period_label})",
-        "```text",
-        f"{'#':>2} {'Hráč':<16} {'Killy':>10} {'Straty':>10} {'Ratio':>8} {'Rep':>4}",
-        "-" * 58,
-    ]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [f"🏆 **Leaderboard podľa zabitých nepriateľov** ({period_label})"]
     for index, entry in enumerate(entries, start=1):
         ratio = format_battle_ratio(entry.stats.total_losses, entry.stats.total_kills)
+        rank = medals.get(index, f"**{index}.**")
         lines.append(
-            f"{index:>2} "
-            f"{compact_name(entry.player_name):<16} "
-            f"{pretty_number(entry.stats.total_kills):>10} "
-            f"{pretty_number(entry.stats.total_losses):>10} "
-            f"{ratio.replace(' ', ''):>8} "
-            f"{entry.stats.report_count:>4}"
+            f"\n{rank} **{compact_name(entry.player_name, 24)}**\n"
+            f"⚔️ **{pretty_number(entry.stats.total_kills)}** killov • "
+            f"💀 **{pretty_number(entry.stats.total_losses)}** strát • "
+            f"📈 **{ratio.replace(' ', '')}** • "
+            f"🧾 **{pretty_number(entry.stats.report_count)}**"
         )
-    lines.append("```")
     return "\n".join(lines)
 
 
