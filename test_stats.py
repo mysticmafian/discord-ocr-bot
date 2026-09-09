@@ -180,8 +180,10 @@ class StatsStoreTests(unittest.TestCase):
 
             text = format_leaderboard(asyncio.run(scenario()))
             self.assertIn("Leaderboard podľa zabitých nepriateľov", text)
-            self.assertIn("**1. Knight**", text)
-            self.assertIn("`400` killov", text)
+            self.assertIn("```text", text)
+            self.assertIn("Hráč", text)
+            self.assertIn("Knight", text)
+            self.assertIn("400", text)
 
 
 if __name__ == "__main__":

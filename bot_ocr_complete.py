@@ -1831,17 +1831,33 @@ def format_leaderboard(
     if not entries:
         return f"🏆 Leaderboard je {period_label} zatiaľ prázdny."
 
-    lines = [f"🏆 **Leaderboard podľa zabitých nepriateľov** ({period_label})"]
+    def compact_name(name: str, max_len: int = 16) -> str:
+        clean_name = " ".join(name.split())
+        if len(clean_name) <= max_len:
+            return clean_name
+        return clean_name[: max_len - 1] + "…"
+
+    def pretty_number(value: int) -> str:
+        return f"{value:,}".replace(",", " ")
+
+    lines = [
+        f"🏆 **Leaderboard podľa zabitých nepriateľov** ({period_label})",
+        "```text",
+        f"{'#':>2} {'Hráč':<16} {'Killy':>10} {'Straty':>10} {'Ratio':>8} {'Rep':>4}",
+        "-" * 58,
+    ]
     for index, entry in enumerate(entries, start=1):
         ratio = format_battle_ratio(entry.stats.total_losses, entry.stats.total_kills)
         lines.append(
-            f"**{index}. {entry.player_name}** — "
-            f"`{entry.stats.total_kills:,}` killov, "
-            f"`{entry.stats.total_losses:,}` strát, "
-            f"ratio `{ratio}`, "
-            f"reporty `{entry.stats.report_count:,}`"
+            f"{index:>2} "
+            f"{compact_name(entry.player_name):<16} "
+            f"{pretty_number(entry.stats.total_kills):>10} "
+            f"{pretty_number(entry.stats.total_losses):>10} "
+            f"{ratio.replace(' ', ''):>8} "
+            f"{entry.stats.report_count:>4}"
         )
-    return "\n".join(lines).replace(",", " ")
+    lines.append("```")
+    return "\n".join(lines)
 
 
 # =============================================================================
