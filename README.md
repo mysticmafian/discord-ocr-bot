@@ -77,7 +77,8 @@ Dashboard je samostatná Railway service v priečinku `dashboard/`. Je read-only
 
 V Railway vytvor novú service z toho istého GitHub repozitára a nastav:
 
-- Dockerfile Path: `dashboard/Dockerfile`
+- Root Directory: `dashboard`
+- Start Command: `sh -c 'uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}'`
 - `DATABASE_URL` – rovnaká hodnota ako pri botovi
 - `DASHBOARD_USERNAME` – napríklad `admin`
 - `DASHBOARD_PASSWORD` – tvoje vlastné heslo
