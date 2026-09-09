@@ -2276,9 +2276,9 @@ def create_discord_client():
             any_success = True
             if result.is_rift:
                 try:
-                    await message.reply("rift sa nepočíta", mention_author=False)
+                    await message.add_reaction("🤏")
                 except discord.HTTPException as exc:
-                    print(f"[GGE] Failed to send Discord reply: {exc}", file=sys.stderr)
+                    print(f"[GGE] Failed to add rift reaction: {exc}", file=sys.stderr)
                 continue
 
             try:
