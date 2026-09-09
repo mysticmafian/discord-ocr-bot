@@ -32,6 +32,10 @@ priamo na správu s reportom textom `!release-report`. Bot tým report vymaže z
 štatistík hráča aj aliancie a rovnaký report sa dá znova započítať správnemu
 hráčovi.
 
+Príkaz `!assign @hráč` funguje ako admin odpoveď na botovu hlášku alebo priamo
+na správu s reportom. Bot priradí započítaný report vybranému hráčovi, takže sa
+odobere pôvodnému autorovi a pripíše novému hráčovi.
+
 Príkaz `!blacklist` funguje tiež ako admin odpoveď na botovu hlášku alebo priamo
 na správu s reportom. Bot report vymaže zo štatistík a jeho hodnoty natrvalo
 zablokuje, takže rovnaký report si už nikto nezapočíta.
@@ -61,4 +65,6 @@ Voliteľné premenné:
   `!release-report`.
 - `BLACKLIST_REPORT_COMMAND` – admin príkaz na trvalé zablokovanie reportu,
   predvolene `!blacklist`.
+- `ASSIGN_REPORT_COMMAND` – admin príkaz na priradenie reportu inému hráčovi,
+  predvolene `!assign`.
 - `GGE_DEBUG=1` – podrobné OCR logy.

@@ -131,6 +131,39 @@ class StatsStoreTests(unittest.TestCase):
             self.assertEqual(right_stats, PlayerStats(1, 50, 80))
             self.assertEqual(alliance_stats, PlayerStats(1, 50, 80))
 
+    def test_assigned_report_moves_stats_to_another_player(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
+
+            async def scenario():
+                await store.initialize()
+                result = BattleResult(70, 210, 300, 1.0)
+                first = await store.record_battle(
+                    guild_id=1, message_id=46, attachment_id=460,
+                    player_id=10, player_name="Wrong", result=result,
+                )
+                updated = await store.assign_report(
+                    guild_id=1,
+                    message_id=46,
+                    player_id=11,
+                    player_name="Right",
+                )
+                wrong_stats = await store.get_player_stats(1, 10)
+                right_stats = await store.get_player_stats(1, 11)
+                alliance_stats = await store.get_alliance_stats(1)
+                leaderboard = await store.get_leaderboard(1)
+                return first, updated, wrong_stats, right_stats, alliance_stats, leaderboard
+
+            first, updated, wrong_stats, right_stats, alliance_stats, leaderboard = asyncio.run(
+                scenario()
+            )
+            self.assertTrue(first.counted)
+            self.assertEqual(updated, 1)
+            self.assertEqual(wrong_stats, PlayerStats(0, 0, 0))
+            self.assertEqual(right_stats, PlayerStats(1, 70, 210))
+            self.assertEqual(alliance_stats, PlayerStats(1, 70, 210))
+            self.assertEqual(leaderboard[0].player_name, "Right")
+
     def test_blacklisted_report_cannot_be_counted_again(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))

@@ -86,6 +86,7 @@ STATS_DB_PATH = os.getenv("STATS_DB_PATH", "battle_stats.sqlite3").strip()
 STATS_COMMAND = os.getenv("STATS_COMMAND", "!stats").strip().lower()
 RELEASE_REPORT_COMMAND = os.getenv("RELEASE_REPORT_COMMAND", "!release-report").strip().lower()
 BLACKLIST_REPORT_COMMAND = os.getenv("BLACKLIST_REPORT_COMMAND", "!blacklist").strip().lower()
+ASSIGN_REPORT_COMMAND = os.getenv("ASSIGN_REPORT_COMMAND", "!assign").strip().lower()
 
 STATS_PERIODS = {
     "1d": ("za posledný 1 deň", 1),
@@ -1918,6 +1919,49 @@ class StatsStore:
             )
             return cursor.rowcount
 
+    async def assign_report(
+        self,
+        guild_id: int,
+        message_id: int,
+        player_id: int,
+        player_name: str,
+    ) -> int:
+        """Move reports recorded from one Discord message to another player."""
+        if self.pool is not None:
+            status = await self.pool.execute(
+                """
+                UPDATE battle_reports
+                SET player_id = $3, player_name = $4
+                WHERE guild_id = $1 AND message_id = $2
+                """,
+                guild_id,
+                message_id,
+                player_id,
+                player_name,
+            )
+            return int(status.rsplit(" ", 1)[-1])
+        return await asyncio.to_thread(
+            self._assign_report_sqlite, guild_id, message_id, player_id, player_name
+        )
+
+    def _assign_report_sqlite(
+        self,
+        guild_id: int,
+        message_id: int,
+        player_id: int,
+        player_name: str,
+    ) -> int:
+        with self._connect_sqlite() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE battle_reports
+                SET player_id = ?, player_name = ?
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (player_id, player_name, guild_id, message_id),
+            )
+            return cursor.rowcount
+
     async def blacklist_report(
         self,
         guild_id: int,
@@ -2348,6 +2392,70 @@ def create_discord_client():
 
         guild_id = message.guild.id if message.guild is not None else 0
         content = (message.content or "").strip().lower()
+        if content == ASSIGN_REPORT_COMMAND or content.startswith(f"{ASSIGN_REPORT_COMMAND} "):
+            if message.guild is None:
+                return
+            if not getattr(message.author.guild_permissions, "administrator", False):
+                await message.reply(
+                    "Na tento príkaz potrebuješ oprávnenie Administrátor.",
+                    mention_author=False,
+                )
+                return
+
+            if not message.mentions:
+                await message.reply(
+                    f"Použi `{ASSIGN_REPORT_COMMAND} @hráč` ako odpoveď na botovu hlášku "
+                    "alebo priamo na správu s reportom.",
+                    mention_author=False,
+                )
+                return
+
+            target_player = message.mentions[0]
+            target_message = await _fetch_referenced_message(message)
+            if target_message is None:
+                await message.reply(
+                    f"Použi `{ASSIGN_REPORT_COMMAND} @hráč` ako odpoveď na botovu hlášku "
+                    "alebo priamo na správu s reportom.",
+                    mention_author=False,
+                )
+                return
+
+            original_message_id = target_message.id
+            if (
+                client.user is not None
+                and target_message.author.id == client.user.id
+                and target_message.reference is not None
+                and target_message.reference.message_id is not None
+            ):
+                original_message_id = target_message.reference.message_id
+
+            await stats_ready.wait()
+            try:
+                updated = await stats_store.assign_report(
+                    guild_id,
+                    original_message_id,
+                    target_player.id,
+                    target_player.display_name,
+                )
+                if updated:
+                    await message.reply(
+                        f"✅ Report bol priradený hráčovi **{target_player.display_name}**. "
+                        f"Presunuté záznamy: `{updated}`.",
+                        mention_author=False,
+                    )
+                else:
+                    await message.reply(
+                        "Nenašiel som k tejto správe žiadny započítaný report.",
+                        mention_author=False,
+                    )
+            except Exception as exc:
+                print(f"[GGE] Assign report error: {type(exc).__name__}: {exc}", file=sys.stderr)
+                await message.reply(
+                    "Report sa momentálne nepodarilo priradiť.",
+                    mention_author=False,
+                )
+            return
+
         if content == BLACKLIST_REPORT_COMMAND:
             if message.guild is None:
                 return
