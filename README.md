@@ -1,3 +1,4 @@
+
 # Discord OCR bot pre Goodgame Empire
 
 Bot analyzuje obrázky bojových reportov, odpovie výsledkom OCR a uloží štatistiky
@@ -68,3 +69,18 @@ Voliteľné premenné:
 - `ASSIGN_REPORT_COMMAND` – admin príkaz na priradenie reportu inému hráčovi,
   predvolene `!assign`.
 - `GGE_DEBUG=1` – podrobné OCR logy.
+
+## Web dashboard
+
+Dashboard je samostatná Railway service v priečinku `dashboard/`. Je read-only,
+čiže len číta štatistiky z rovnakej PostgreSQL databázy ako bot.
+
+V Railway vytvor novú service z toho istého GitHub repozitára a nastav:
+
+- Dockerfile Path: `dashboard/Dockerfile`
+- `DATABASE_URL` – rovnaká hodnota ako pri botovi
+- `DASHBOARD_USERNAME` – napríklad `admin`
+- `DASHBOARD_PASSWORD` – tvoje vlastné heslo
+
+Po deployi otvoríš URL novej Railway service a prihlásiš sa týmto menom a
+heslom.
