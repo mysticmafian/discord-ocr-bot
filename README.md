@@ -44,8 +44,8 @@ Príkaz `/stats-alliance` s rovnakým výberom obdobia zobrazí spoločný súhr
 všetkých hráčov na Discord serveri.
 
 Príkaz `/leaderboard` zobrazí TOP 10 hráčov zoradených podľa počtu zabitých
-nepriateľských vojakov. Aj tu si hráč vyberá obdobie `1 deň`, `7 dní` alebo
-`Celé obdobie`.
+nepriateľských vojakov. Pri každom hráčovi zobrazí aj celkové straty a ratio.
+Aj tu si hráč vyberá obdobie `1 deň`, `7 dní` alebo `Celé obdobie`.
 
 ## Railway
 

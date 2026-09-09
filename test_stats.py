@@ -296,8 +296,8 @@ class StatsStoreTests(unittest.TestCase):
             self.assertNotIn("```text", text)
             self.assertIn("🥇 **Knight**", text)
             self.assertIn("**400** killov", text)
-            self.assertNotIn("strát", text)
-            self.assertNotIn("ratio", text.lower())
+            self.assertIn("**100** strát", text)
+            self.assertIn("**1:4.00**", text)
 
 
 if __name__ == "__main__":
