@@ -89,6 +89,37 @@ class StatsStoreTests(unittest.TestCase):
             self.assertEqual(first_stats, PlayerStats(1, 50, 80))
             self.assertEqual(second_stats, PlayerStats(0, 0, 0))
 
+    def test_released_report_can_be_counted_by_another_player(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))
+
+            async def scenario():
+                await store.initialize()
+                result = BattleResult(50, 80, 100, 1.0)
+                first = await store.record_battle(
+                    guild_id=1, message_id=45, attachment_id=450,
+                    player_id=10, player_name="Wrong", result=result,
+                )
+                deleted = await store.release_report(1, 45)
+                second = await store.record_battle(
+                    guild_id=1, message_id=46, attachment_id=460,
+                    player_id=11, player_name="Right", result=result,
+                )
+                wrong_stats = await store.get_player_stats(1, 10)
+                right_stats = await store.get_player_stats(1, 11)
+                alliance_stats = await store.get_alliance_stats(1)
+                return first, deleted, second, wrong_stats, right_stats, alliance_stats
+
+            first, deleted, second, wrong_stats, right_stats, alliance_stats = asyncio.run(
+                scenario()
+            )
+            self.assertTrue(first.counted)
+            self.assertEqual(deleted, 1)
+            self.assertTrue(second.counted)
+            self.assertEqual(wrong_stats, PlayerStats(0, 0, 0))
+            self.assertEqual(right_stats, PlayerStats(1, 50, 80))
+            self.assertEqual(alliance_stats, PlayerStats(1, 50, 80))
+
     def test_alliance_stats_aggregate_all_players(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StatsStore(sqlite_path=str(Path(tmp) / "stats.sqlite3"))

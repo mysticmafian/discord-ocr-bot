@@ -84,6 +84,7 @@ DEBUG = os.getenv("GGE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 STATS_DB_PATH = os.getenv("STATS_DB_PATH", "battle_stats.sqlite3").strip()
 STATS_COMMAND = os.getenv("STATS_COMMAND", "!stats").strip().lower()
+RELEASE_REPORT_COMMAND = os.getenv("RELEASE_REPORT_COMMAND", "!release-report").strip().lower()
 
 STATS_PERIODS = {
     "1d": ("za posledný 1 deň", 1),
@@ -1769,6 +1770,31 @@ class StatsStore:
             for row in rows
         ]
 
+    async def release_report(self, guild_id: int, message_id: int) -> int:
+        """Delete reports recorded from one Discord message and return the count."""
+        if self.pool is not None:
+            status = await self.pool.execute(
+                """
+                DELETE FROM battle_reports
+                WHERE guild_id = $1 AND message_id = $2
+                """,
+                guild_id,
+                message_id,
+            )
+            return int(status.rsplit(" ", 1)[-1])
+        return await asyncio.to_thread(self._release_report_sqlite, guild_id, message_id)
+
+    def _release_report_sqlite(self, guild_id: int, message_id: int) -> int:
+        with self._connect_sqlite() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM battle_reports
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (guild_id, message_id),
+            )
+            return cursor.rowcount
+
     async def reset_player_stats(
         self, guild_id: int, player_id: int, since_days: Optional[int] = None
     ) -> int:
@@ -1891,6 +1917,22 @@ async def _analyze_attachment(attachment) -> Optional[BattleResult]:
         return None
     except Exception as exc:
         print(f"[GGE] OCR error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+
+
+async def _fetch_referenced_message(message):
+    reference = getattr(message, "reference", None)
+    if reference is None or reference.message_id is None:
+        return None
+
+    resolved = getattr(reference, "resolved", None)
+    if resolved is not None:
+        return resolved
+
+    try:
+        return await message.channel.fetch_message(reference.message_id)
+    except Exception as exc:
+        print(f"[GGE] Failed to fetch referenced message: {exc}", file=sys.stderr)
         return None
 
 
@@ -2082,6 +2124,56 @@ def create_discord_client():
 
         guild_id = message.guild.id if message.guild is not None else 0
         content = (message.content or "").strip().lower()
+        if content == RELEASE_REPORT_COMMAND:
+            if message.guild is None:
+                return
+            if not getattr(message.author.guild_permissions, "administrator", False):
+                await message.reply(
+                    "Na tento príkaz potrebuješ oprávnenie Administrátor.",
+                    mention_author=False,
+                )
+                return
+
+            target_message = await _fetch_referenced_message(message)
+            if target_message is None:
+                await message.reply(
+                    f"Použi `{RELEASE_REPORT_COMMAND}` ako odpoveď na botovu hlášku "
+                    "alebo priamo na správu s reportom.",
+                    mention_author=False,
+                )
+                return
+
+            original_message_id = target_message.id
+            if (
+                client.user is not None
+                and target_message.author.id == client.user.id
+                and target_message.reference is not None
+                and target_message.reference.message_id is not None
+            ):
+                original_message_id = target_message.reference.message_id
+
+            await stats_ready.wait()
+            try:
+                deleted = await stats_store.release_report(guild_id, original_message_id)
+                if deleted:
+                    await message.reply(
+                        f"✅ Report bol uvoľnený. Vymazané záznamy: `{deleted}`. "
+                        "Teraz ho môže nahrať správny hráč.",
+                        mention_author=False,
+                    )
+                else:
+                    await message.reply(
+                        "Nenašiel som k tejto správe žiadny započítaný report.",
+                        mention_author=False,
+                    )
+            except Exception as exc:
+                print(f"[GGE] Release report error: {type(exc).__name__}: {exc}", file=sys.stderr)
+                await message.reply(
+                    "Report sa momentálne nepodarilo uvoľniť.",
+                    mention_author=False,
+                )
+            return
+
         if content == STATS_COMMAND:
             await stats_ready.wait()
             try:

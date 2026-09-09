@@ -24,6 +24,11 @@ Administrátor môže cez `/stats-reset` vybrať hráča aj obdobie, ktorého ul
 reporty sa majú vymazať. Bot oprávnenie Administrátor kontroluje aj pri vykonaní
 príkazu.
 
+Administrátor môže tiež odpovedať na botovu hlášku o započítaní reportu alebo
+priamo na správu s reportom textom `!release-report`. Bot tým report vymaže zo
+štatistík hráča aj aliancie a rovnaký report sa dá znova započítať správnemu
+hráčovi.
+
 Príkaz `/stats-alliance` s rovnakým výberom obdobia zobrazí spoločný súhrn
 všetkých hráčov na Discord serveri.
 
@@ -45,4 +50,6 @@ inak sa dáta pri novom deployi môžu stratiť.
 Voliteľné premenné:
 
 - `STATS_COMMAND` – voliteľný starší textový príkaz, predvolene `!stats`.
+- `RELEASE_REPORT_COMMAND` – admin príkaz na uvoľnenie reportu, predvolene
+  `!release-report`.
 - `GGE_DEBUG=1` – podrobné OCR logy.
