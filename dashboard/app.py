@@ -1,14 +1,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import html
 import io
+import json
 import os
 import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import parse_qs, urlencode
+from urllib import error as urlerror
+from urllib import request as urlrequest
+from urllib.parse import parse_qs, quote, urlencode
 
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -19,6 +24,14 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin").strip()
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
+ALLIANCE_NAME = os.getenv("TRACKER_ALLIANCE_NAME", "ROYAL SOLDIERS").strip()
+TRACKER_SERVER = os.getenv("TRACKER_SERVER", "SK1").strip()
+TRACKER_API_BASE = os.getenv("TRACKER_API_BASE", "https://api.gge-tracker.com/api/v1").rstrip("/")
+TRACKER_SYNC_INTERVAL_SECONDS = int(os.getenv("TRACKER_SYNC_INTERVAL_SECONDS", "1800"))
+TRACKER_USER_AGENT = os.getenv(
+    "TRACKER_USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+)
 
 PERIODS: dict[str, str] = {
     "24h": "24h",
@@ -26,18 +39,33 @@ PERIODS: dict[str, str] = {
     "30d": "30 dní",
     "all": "Celé obdobie",
 }
+POWER_PERIODS: dict[str, tuple[str, str]] = {
+    "24h": ("24h", "24 hours"),
+    "7d": ("7 dní", "7 days"),
+    "30d": ("30 dní", "30 days"),
+}
 ADMIN_REPORTS_PER_PAGE = 10
 
 security = HTTPBasic()
 pool: asyncpg.Pool | None = None
+tracker_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool
+    global pool, tracker_task
     if DATABASE_URL:
         pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        await ensure_dashboard_tables()
+        tracker_task = asyncio.create_task(tracker_sync_loop())
     yield
+    if tracker_task is not None:
+        tracker_task.cancel()
+        try:
+            await tracker_task
+        except asyncio.CancelledError:
+            pass
+        tracker_task = None
     if pool is not None:
         await pool.close()
         pool = None
@@ -70,6 +98,228 @@ def ensure_pool() -> asyncpg.Pool:
             detail="DATABASE_URL is missing or database connection is not ready.",
         )
     return pool
+
+
+async def ensure_dashboard_tables() -> None:
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS discord_members (
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                display_name TEXT NOT NULL,
+                username TEXT,
+                is_bot BOOLEAN NOT NULL DEFAULT FALSE,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracker_players (
+                server TEXT NOT NULL,
+                player_id BIGINT NOT NULL,
+                player_name TEXT NOT NULL,
+                alliance_id BIGINT,
+                alliance_name TEXT NOT NULL,
+                alliance_rank INTEGER,
+                level INTEGER,
+                legendary_level INTEGER,
+                might_current BIGINT NOT NULL DEFAULT 0,
+                might_all_time BIGINT NOT NULL DEFAULT 0,
+                loot_current BIGINT NOT NULL DEFAULT 0,
+                honor BIGINT NOT NULL DEFAULT 0,
+                tracker_updated_at TIMESTAMPTZ,
+                synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (server, player_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracker_power_snapshots (
+                server TEXT NOT NULL,
+                player_id BIGINT NOT NULL,
+                player_name TEXT NOT NULL,
+                alliance_name TEXT NOT NULL,
+                might_points BIGINT NOT NULL,
+                recorded_at TIMESTAMPTZ NOT NULL,
+                source TEXT NOT NULL DEFAULT 'tracker',
+                PRIMARY KEY (server, player_id, recorded_at)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS tracker_power_snapshots_player_time_idx
+            ON tracker_power_snapshots (server, player_id, recorded_at DESC)
+            """
+        )
+
+
+def tracker_json(path: str) -> Any:
+    url = f"{TRACKER_API_BASE}{path}"
+    headers = {
+        "User-Agent": TRACKER_USER_AGENT,
+        "Accept": "application/json",
+        "Referer": "https://docs.gge-tracker.com/",
+        "gge-server": TRACKER_SERVER,
+    }
+    req = urlrequest.Request(url, headers=headers)
+    with urlrequest.urlopen(req, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+async def tracker_json_async(path: str) -> Any:
+    return await asyncio.to_thread(tracker_json, path)
+
+
+def parse_tracker_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+async def sync_tracker_power() -> dict[str, int]:
+    """Fetch ROYAL SOLDIERS from GGE Tracker and store current + historic might points."""
+    db = ensure_pool()
+    alliance_path = f"/alliances/name/{quote(ALLIANCE_NAME)}"
+    alliance = await tracker_json_async(alliance_path)
+    alliance_id = to_int(alliance.get("alliance_id"))
+    if not alliance_id:
+        raise RuntimeError(f"GGE Tracker did not return alliance_id for {ALLIANCE_NAME!r}.")
+
+    detail = await tracker_json_async(f"/alliances/id/{alliance_id}")
+    players = detail.get("players") or []
+    history: list[dict[str, Any]] = []
+    try:
+        stats = await tracker_json_async(f"/statistics/alliance/{alliance_id}")
+        history = (stats.get("points") or {}).get("player_might_history") or []
+    except (urlerror.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"[DASHBOARD] Tracker history sync failed: {type(exc).__name__}: {exc}")
+
+    current_time = utc_now()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            for player in players:
+                player_id = to_int(player.get("player_id"))
+                if not player_id:
+                    continue
+                tracker_updated_at = parse_tracker_time(player.get("updated_at"))
+                await conn.execute(
+                    """
+                    INSERT INTO tracker_players (
+                        server, player_id, player_name, alliance_id, alliance_name,
+                        alliance_rank, level, legendary_level, might_current, might_all_time,
+                        loot_current, honor, tracker_updated_at, synced_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+                    ON CONFLICT (server, player_id) DO UPDATE SET
+                        player_name = EXCLUDED.player_name,
+                        alliance_id = EXCLUDED.alliance_id,
+                        alliance_name = EXCLUDED.alliance_name,
+                        alliance_rank = EXCLUDED.alliance_rank,
+                        level = EXCLUDED.level,
+                        legendary_level = EXCLUDED.legendary_level,
+                        might_current = EXCLUDED.might_current,
+                        might_all_time = EXCLUDED.might_all_time,
+                        loot_current = EXCLUDED.loot_current,
+                        honor = EXCLUDED.honor,
+                        tracker_updated_at = EXCLUDED.tracker_updated_at,
+                        synced_at = NOW()
+                    """,
+                    TRACKER_SERVER,
+                    player_id,
+                    str(player.get("player_name") or player_id),
+                    alliance_id,
+                    detail.get("alliance_name") or ALLIANCE_NAME,
+                    to_int(player.get("alliance_rank"), -1),
+                    to_int(player.get("level")),
+                    to_int(player.get("legendary_level")),
+                    to_int(player.get("might_current")),
+                    to_int(player.get("might_all_time")),
+                    to_int(player.get("loot_current")),
+                    to_int(player.get("honor")),
+                    tracker_updated_at,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO tracker_power_snapshots (
+                        server, player_id, player_name, alliance_name, might_points, recorded_at, source
+                    ) VALUES ($1, $2, $3, $4, $5, $6, 'current')
+                    ON CONFLICT (server, player_id, recorded_at) DO NOTHING
+                    """,
+                    TRACKER_SERVER,
+                    player_id,
+                    str(player.get("player_name") or player_id),
+                    detail.get("alliance_name") or ALLIANCE_NAME,
+                    to_int(player.get("might_current")),
+                    tracker_updated_at or current_time,
+                )
+
+            for point in history:
+                player_id = to_int(point.get("player_id"))
+                recorded_at = parse_tracker_time(point.get("date"))
+                might_points = to_int(point.get("point"), -1)
+                if not player_id or recorded_at is None or might_points < 0:
+                    continue
+                await conn.execute(
+                    """
+                    INSERT INTO tracker_power_snapshots (
+                        server, player_id, player_name, alliance_name, might_points, recorded_at, source
+                    ) VALUES (
+                        $1, $2,
+                        COALESCE((SELECT player_name FROM tracker_players WHERE server = $1 AND player_id = $2), $3),
+                        $4, $5, $6, 'history'
+                    )
+                    ON CONFLICT (server, player_id, recorded_at) DO UPDATE SET
+                        might_points = EXCLUDED.might_points,
+                        player_name = EXCLUDED.player_name,
+                        alliance_name = EXCLUDED.alliance_name,
+                        source = EXCLUDED.source
+                    """,
+                    TRACKER_SERVER,
+                    player_id,
+                    str(player_id),
+                    detail.get("alliance_name") or ALLIANCE_NAME,
+                    might_points,
+                    recorded_at,
+                )
+    return {"players": len(players), "history": len(history)}
+
+
+async def tracker_sync_loop() -> None:
+    while True:
+        try:
+            result = await sync_tracker_power()
+            print(
+                f"[DASHBOARD] Synced GGE Tracker power: {result['players']} players, "
+                f"{result['history']} history points"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[DASHBOARD] Tracker sync failed: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(max(300, TRACKER_SYNC_INTERVAL_SECONDS))
 
 
 def esc(value: Any) -> str:
@@ -290,14 +540,29 @@ async def fetch_admin_data(*, page: int = 1, report_limit: int = ADMIN_REPORTS_P
         report_count = await conn.fetchval("SELECT COUNT(*) FROM battle_reports")
         players = await conn.fetch(
             """
-            SELECT player_id, MAX(player_name) AS player_name,
-                   COUNT(*) AS report_count,
-                   COALESCE(SUM(own_losses), 0) AS total_losses,
-                   COALESCE(SUM(enemy_kills), 0) AS total_kills
-            FROM battle_reports
-            GROUP BY player_id
-            ORDER BY total_kills DESC, player_name ASC
-            LIMIT 200
+            WITH report_totals AS (
+                SELECT guild_id, player_id, MAX(player_name) AS player_name,
+                       COUNT(*) AS report_count,
+                       COALESCE(SUM(own_losses), 0) AS total_losses,
+                       COALESCE(SUM(enemy_kills), 0) AS total_kills
+                FROM battle_reports
+                GROUP BY guild_id, player_id
+            )
+            SELECT
+                COALESCE(dm.guild_id, rt.guild_id) AS guild_id,
+                COALESCE(dm.user_id, rt.player_id) AS player_id,
+                COALESCE(NULLIF(dm.display_name, ''), rt.player_name, dm.username, rt.player_id::text) AS player_name,
+                COALESCE(rt.report_count, 0) AS report_count,
+                COALESCE(rt.total_losses, 0) AS total_losses,
+                COALESCE(rt.total_kills, 0) AS total_kills,
+                COALESCE(dm.is_active, TRUE) AS is_active
+            FROM discord_members dm
+            FULL OUTER JOIN report_totals rt
+              ON rt.guild_id = dm.guild_id AND rt.player_id = dm.user_id
+            WHERE COALESCE(dm.is_bot, FALSE) = FALSE
+              AND COALESCE(dm.is_active, TRUE) = TRUE
+            ORDER BY LOWER(COALESCE(NULLIF(dm.display_name, ''), rt.player_name, dm.username, rt.player_id::text)) ASC
+            LIMIT 500
             """
         )
         blacklist = await conn.fetch(
@@ -322,6 +587,7 @@ async def fetch_admin_data(*, page: int = 1, report_limit: int = ADMIN_REPORTS_P
 def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     nav = [
         ("dashboard", "/", "Dashboard"),
+        ("power", "/power", "Power"),
         ("export", "/export.csv", "CSV export"),
         ("admin", "/admin", "Admin"),
     ]
@@ -398,7 +664,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
 <body>
   <main class="shell">
     <header class="topbar">
-      <a class="brand" href="/"><span class="crest">♛</span><span><strong>GGE Report Dashboard</strong><span>Aliancia · reporty · ratio</span></span></a>
+      <a class="brand" href="/"><span class="crest">♛</span><span><strong>ROYAL SOLDIERS</strong><span>Reporty · ratio · power</span></span></a>
       <nav class="nav">{nav_html}</nav>
     </header>
     {body}
@@ -473,6 +739,221 @@ def render_chart(rows: list[dict[str, Any]]) -> str:
     return f'<div class="bars">{"".join(bars)}</div><div class="report-meta">Zlatá = killy, červená = straty.</div>'
 
 
+def power_period(request: Request) -> str:
+    period = request.query_params.get("period", "24h")
+    return period if period in POWER_PERIODS else "24h"
+
+
+async def fetch_power_data(period: str) -> dict[str, Any]:
+    db = ensure_pool()
+    _, interval = POWER_PERIODS[period]
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                p.player_id,
+                p.player_name,
+                p.level,
+                p.legendary_level,
+                p.alliance_rank,
+                p.might_current,
+                p.might_all_time,
+                p.tracker_updated_at,
+                p.synced_at,
+                COALESCE(before_cutoff.might_points, first_available.might_points, p.might_current) AS baseline_might,
+                COALESCE(before_cutoff.recorded_at, first_available.recorded_at, p.tracker_updated_at, p.synced_at) AS baseline_at
+            FROM tracker_players p
+            LEFT JOIN LATERAL (
+                SELECT might_points, recorded_at
+                FROM tracker_power_snapshots s
+                WHERE s.server = p.server
+                  AND s.player_id = p.player_id
+                  AND s.recorded_at <= NOW() - ($2::interval)
+                ORDER BY s.recorded_at DESC
+                LIMIT 1
+            ) before_cutoff ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT might_points, recorded_at
+                FROM tracker_power_snapshots s
+                WHERE s.server = p.server
+                  AND s.player_id = p.player_id
+                ORDER BY s.recorded_at ASC
+                LIMIT 1
+            ) first_available ON TRUE
+            WHERE p.server = $1 AND p.alliance_name = $3
+            ORDER BY p.might_current DESC, LOWER(p.player_name) ASC
+            """,
+            TRACKER_SERVER,
+            interval,
+            ALLIANCE_NAME,
+        )
+        last_sync = await conn.fetchval(
+            """
+            SELECT MAX(synced_at)
+            FROM tracker_players
+            WHERE server = $1 AND alliance_name = $2
+            """,
+            TRACKER_SERVER,
+            ALLIANCE_NAME,
+        )
+    return {"players": [dict(row) for row in rows], "last_sync": last_sync, "period": period}
+
+
+async def fetch_power_player_data(player_id: int, period: str) -> dict[str, Any]:
+    db = ensure_pool()
+    _, interval = POWER_PERIODS[period]
+    async with db.acquire() as conn:
+        player = await conn.fetchrow(
+            """
+            SELECT *
+            FROM tracker_players
+            WHERE server = $1 AND player_id = $2
+            """,
+            TRACKER_SERVER,
+            player_id,
+        )
+        history = await conn.fetch(
+            """
+            SELECT recorded_at, might_points
+            FROM tracker_power_snapshots
+            WHERE server = $1
+              AND player_id = $2
+              AND recorded_at >= NOW() - ($3::interval)
+            ORDER BY recorded_at ASC
+            LIMIT 500
+            """,
+            TRACKER_SERVER,
+            player_id,
+            interval,
+        )
+    if player is None:
+        raise HTTPException(status_code=404, detail="Power hráč nebol nájdený.")
+    return {"player": dict(player), "history": [dict(row) for row in history], "period": period}
+
+
+def fmt_signed(value: int) -> str:
+    sign = "+" if value > 0 else ""
+    return f"{sign}{fmt_number(value)}"
+
+
+def render_power_tabs(period: str, base: str = "/power") -> str:
+    return "".join(
+        f'<a class="tab {"active" if key == period else ""}" href="{base}?period={key}">{esc(label)}</a>'
+        for key, (label, _) in POWER_PERIODS.items()
+    )
+
+
+def render_power_chart(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<div class="empty">Zatiaľ nemáme historické power dáta pre toto obdobie.</div>'
+    sample = rows[-60:]
+    values = [int(row["might_points"] or 0) for row in sample]
+    min_value = min(values)
+    max_value = max(values)
+    span = max(max_value - min_value, 1)
+    bars = []
+    for row in sample:
+        value = int(row["might_points"] or 0)
+        recorded_at = row["recorded_at"].strftime("%d.%m. %H:%M")
+        bars.append(
+            f"""
+            <div class="bar-wrap" title="{esc(recorded_at)} · power {fmt_number(value)}">
+              <div class="bar" style="height:{max(4, round(((value - min_value) / span) * 170))}px"></div>
+              <span class="bar-label">{esc(row["recorded_at"].strftime("%d.%m."))}</span>
+            </div>
+            """
+        )
+    return f'<div class="bars">{"".join(bars)}</div><div class="report-meta">Graf je škálovaný medzi najnižšou a najvyššou hodnotou v zobrazenom období.</div>'
+
+
+def render_power_page(data: dict[str, Any]) -> str:
+    period = data["period"]
+    period_label_text = POWER_PERIODS[period][0]
+    rows = []
+    total_might = 0
+    total_delta = 0
+    for index, row in enumerate(data["players"], start=1):
+        current = int(row["might_current"] or 0)
+        baseline = int(row["baseline_might"] or current)
+        delta = current - baseline
+        total_might += current
+        total_delta += delta
+        delta_class = "good" if delta > 0 else "bad" if delta < 0 else ""
+        updated_at = row["tracker_updated_at"] or row["synced_at"]
+        updated_label = updated_at.strftime("%d.%m. %H:%M") if hasattr(updated_at, "strftime") else "—"
+        rows.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f'<td><a class="player-link" href="/power/{int(row["player_id"])}?period={period}">{esc(row["player_name"])}</a></td>'
+            f'<td class="num">{fmt_number(current)}</td>'
+            f'<td class="num {delta_class}">{fmt_signed(delta)}</td>'
+            f'<td class="num">{int(row["level"] or 0)}/{int(row["legendary_level"] or 0)}</td>'
+            f"<td>{esc(updated_label)}</td>"
+            "</tr>"
+        )
+    body_rows = "\n".join(rows) or '<tr><td colspan="6" class="empty">Zatiaľ nemám dáta z GGE Trackeru. Skús refresh o chvíľu.</td></tr>'
+    last_sync = data["last_sync"].strftime("%d.%m. %H:%M") if hasattr(data["last_sync"], "strftime") else "zatiaľ bez syncu"
+    cards = [
+        ("Členovia", fmt_number(len(data["players"]))),
+        ("Power spolu", fmt_number(total_might)),
+        (f"Zmena {period_label_text}", fmt_signed(total_delta)),
+    ]
+    cards_html = "".join(f'<section class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></section>' for label, value in cards)
+    body = f"""
+    <section class="hero">
+      <div class="hero-card">
+        <h1>Power · ROYAL SOLDIERS</h1>
+        <p class="subtitle">Mená a moc členov z GGE Trackeru. Dáta sa pravidelne aktualizujú automaticky; posledný sync: <strong>{esc(last_sync)}</strong>.</p>
+        <div class="periods">{render_power_tabs(period)}</div>
+      </div>
+      <div class="filters hero-card">
+        <h3>Zdroj</h3>
+        <p class="subtitle" style="margin:0">Server: <strong>{esc(TRACKER_SERVER)}</strong><br>Aliancia: <strong>{esc(ALLIANCE_NAME)}</strong><br>Interval syncu: približne každých {fmt_number(TRACKER_SYNC_INTERVAL_SECONDS // 60)} min.</p>
+      </div>
+    </section>
+    <section class="cards" style="grid-template-columns:repeat(3,minmax(0,1fr))">{cards_html}</section>
+    <section class="panel"><div class="panel-head"><h2>Členovia podľa power</h2><span class="pill">{esc(period_label_text)}</span></div>
+      <table><thead><tr><th>#</th><th>Hráč</th><th class="num">Power</th><th class="num">Zmena</th><th class="num">Level</th><th>Update</th></tr></thead><tbody>{body_rows}</tbody></table>
+    </section>
+    """
+    return layout("Power · ROYAL SOLDIERS", body, active="power")
+
+
+def render_power_player_page(player_id: int, data: dict[str, Any]) -> str:
+    period = data["period"]
+    player = data["player"]
+    history = data["history"]
+    current = int(player["might_current"] or 0)
+    first = int(history[0]["might_points"]) if history else current
+    delta = current - first
+    cards = [
+        ("Aktuálny power", fmt_number(current)),
+        (f"Zmena {POWER_PERIODS[period][0]}", fmt_signed(delta)),
+        ("All-time max", fmt_number(int(player["might_all_time"] or 0))),
+    ]
+    cards_html = "".join(f'<section class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></section>' for label, value in cards)
+    points = []
+    for row in history[-30:]:
+        points.append(
+            f"<tr><td>{esc(row['recorded_at'].strftime('%d.%m. %H:%M'))}</td><td class='num'>{fmt_number(int(row['might_points'] or 0))}</td></tr>"
+        )
+    history_rows = "\n".join(points) or '<tr><td colspan="2" class="empty">Zatiaľ žiadna história.</td></tr>'
+    body = f"""
+    <section class="hero">
+      <div class="hero-card">
+        <a class="tab" href="/power?period={period}">← Späť na Power</a>
+        <h1 style="margin-top:16px">{esc(player["player_name"])}</h1>
+        <p class="subtitle">Vývoj moci hráča podľa dát z GGE Trackeru. Player ID: <code>{int(player_id)}</code></p>
+        <div class="periods">{render_power_tabs(period, f"/power/{int(player_id)}")}</div>
+      </div>
+      <div class="panel"><div class="panel-head"><h2>Trend power</h2></div><div class="panel-body">{render_power_chart(history)}</div></div>
+    </section>
+    <section class="cards" style="grid-template-columns:repeat(3,minmax(0,1fr))">{cards_html}</section>
+    <section class="panel"><div class="panel-head"><h2>Posledné body</h2></div><table><thead><tr><th>Čas</th><th class="num">Power</th></tr></thead><tbody>{history_rows}</tbody></table></section>
+    """
+    return layout(f"{player['player_name']} · Power", body, active="power")
+
+
 def render_leaderboard(rows: list[dict[str, Any]], period: str, date_from: str | None, date_to: str | None) -> str:
     table_rows = []
     qs = query_string(period, date_from, date_to)
@@ -532,7 +1013,7 @@ def render_dashboard(data: dict[str, Any], period: str, date_from: str | None, d
     body = f"""
     <section class="hero">
       <div class="hero-card">
-        <h1>Aliancia pod kontrolou</h1>
+        <h1>ROYAL SOLDIERS</h1>
         <p class="subtitle">Prehľad killov, strát, ratio, reportov a aktivity hráčov za <strong>{esc(label)}</strong>.</p>
         <div class="periods">{render_period_tabs(period, date_from, date_to)}</div>
       </div>
@@ -607,7 +1088,9 @@ def render_admin_pagination(current_page: int, total_reports: int, per_page: int
 
 def render_admin(data: dict[str, Any], message: str | None = None) -> str:
     player_options = "".join(
-        f'<option value="{int(row["player_id"])}">{esc(row["player_name"])} · {fmt_number(row["total_kills"])} killov</option>'
+        f'<option value="{int(row["player_id"])}">{esc(row["player_name"])}'
+        f' · {fmt_number(row["total_kills"])} killov'
+        f'{" · bez reportu" if int(row["report_count"] or 0) == 0 else ""}</option>'
         for row in data["players"]
     )
     assign_options = '<option value="">Vyber Discord meno…</option>' + player_options
@@ -616,10 +1099,12 @@ def render_admin(data: dict[str, Any], message: str | None = None) -> str:
         losses = int(row["own_losses"] or 0)
         kills = int(row["enemy_kills"] or 0)
         msg_id = int(row["message_id"])
+        guild_id = int(row["guild_id"])
         player_id = int(row["player_id"])
         release_fields = f'<input type="hidden" name="message_id" value="{msg_id}">'
         assign_fields = (
             f'<input type="hidden" name="message_id" value="{msg_id}">'
+            f'<input type="hidden" name="guild_id" value="{guild_id}">'
             f'<select name="target_player_id" required>{assign_options}</select>'
         )
         report_rows.append(
@@ -685,26 +1170,35 @@ async def release_by_message(message_id: int) -> int:
     return int(status.rsplit(" ", 1)[-1])
 
 
-async def assign_by_message(message_id: int, target_player_id: int) -> int:
+async def assign_by_message(guild_id: int, message_id: int, target_player_id: int) -> int:
     db = ensure_pool()
     async with db.acquire() as conn:
         player_name = await conn.fetchval(
             """
-            SELECT player_name
-            FROM battle_reports
-            WHERE player_id = $1
-            ORDER BY created_at DESC
+            SELECT player_name FROM (
+                SELECT COALESCE(NULLIF(display_name, ''), username, user_id::text) AS player_name,
+                       updated_at AS sort_time
+                FROM discord_members
+                WHERE guild_id = $1 AND user_id = $2 AND is_bot = FALSE
+                UNION ALL
+                SELECT player_name, created_at AS sort_time
+                FROM battle_reports
+                WHERE guild_id = $1 AND player_id = $2
+            ) source
+            ORDER BY sort_time DESC
             LIMIT 1
             """,
+            guild_id,
             target_player_id,
         )
         if not player_name:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Selected Discord player was not found in stored reports.",
+                detail="Selected Discord player was not found in stored members or reports.",
             )
         status_text = await conn.execute(
-            "UPDATE battle_reports SET player_id = $2, player_name = $3 WHERE message_id = $1",
+            "UPDATE battle_reports SET player_id = $3, player_name = $4 WHERE guild_id = $1 AND message_id = $2",
+            guild_id,
             message_id,
             target_player_id,
             player_name,
@@ -788,6 +1282,20 @@ async def player_detail(player_id: int, request: Request):
     return HTMLResponse(render_player_page(player_id, data, period, date_from, date_to))
 
 
+@app.get("/power", response_class=HTMLResponse)
+async def power_page(request: Request):
+    period = power_period(request)
+    data = await fetch_power_data(period)
+    return HTMLResponse(render_power_page(data))
+
+
+@app.get("/power/{player_id}", response_class=HTMLResponse)
+async def power_player_page(player_id: int, request: Request):
+    period = power_period(request)
+    data = await fetch_power_player_data(player_id, period)
+    return HTMLResponse(render_power_player_page(player_id, data))
+
+
 @app.get("/export.csv")
 async def export_csv(request: Request):
     period, date_from, date_to = get_filters(request)
@@ -853,7 +1361,9 @@ async def admin_release(request: Request, user: str = Depends(require_auth)):
 @app.post("/admin/assign")
 async def admin_assign(request: Request, user: str = Depends(require_auth)):
     form = parse_form_body(await request.body())
-    updated = await assign_by_message(int(form["message_id"]), int(form["target_player_id"]))
+    updated = await assign_by_message(
+        int(form["guild_id"]), int(form["message_id"]), int(form["target_player_id"])
+    )
     return admin_redirect(f"Assign hotový. Presunuté reporty: {updated}.")
 
 
