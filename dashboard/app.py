@@ -1,15 +1,18 @@
 
 from __future__ import annotations
 
+import csv
 import html
+import io
 import os
 import secrets
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import parse_qs, urlencode
 
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 
@@ -17,10 +20,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin").strip()
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
 
-PERIODS: dict[str, tuple[str, int | None]] = {
-    "1d": ("1 deň", 1),
-    "7d": ("7 dní", 7),
-    "all": ("Celé obdobie", None),
+PERIODS: dict[str, str] = {
+    "24h": "24h",
+    "7d": "7 dní",
+    "30d": "30 dní",
+    "all": "Celé obdobie",
 }
 
 security = HTTPBasic()
@@ -47,7 +51,6 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Set DASHBOARD_PASSWORD in Railway Variables first.",
         )
-
     username_ok = secrets.compare_digest(credentials.username, DASHBOARD_USERNAME)
     password_ok = secrets.compare_digest(credentials.password, DASHBOARD_PASSWORD)
     if not (username_ok and password_ok):
@@ -59,10 +62,17 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:
     return credentials.username
 
 
-def normalize_period(period: str | None) -> tuple[str, str, int | None]:
-    key = period if period in PERIODS else "all"
-    label, days = PERIODS[key]
-    return key, label, days
+def ensure_pool() -> asyncpg.Pool:
+    if pool is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="DATABASE_URL is missing or database connection is not ready.",
+        )
+    return pool
+
+
+def esc(value: Any) -> str:
+    return html.escape(str(value), quote=True)
 
 
 def fmt_number(value: int | None) -> str:
@@ -77,271 +87,680 @@ def fmt_ratio(losses: int | None, kills: int | None) -> str:
     return f"1:{kills / losses:.2f}"
 
 
-def esc(value: Any) -> str:
-    return html.escape(str(value), quote=True)
+def ratio_score(losses: int | None, kills: int | None) -> float:
+    losses = int(losses or 0)
+    kills = int(kills or 0)
+    if losses <= 0:
+        return float(kills) if kills else 1.0
+    return kills / losses
 
 
-async def fetch_dashboard_data(period_days: int | None) -> dict[str, Any]:
-    if pool is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="DATABASE_URL is missing or database connection is not ready.",
-        )
+def period_label(period: str, date_from: str | None = None, date_to: str | None = None) -> str:
+    if date_from or date_to:
+        if date_from and date_to:
+            return f"{date_from} – {date_to}"
+        return f"od {date_from}" if date_from else f"do {date_to}"
+    return PERIODS.get(period, PERIODS["all"])
 
-    async with pool.acquire() as conn:
+
+def get_filters(request: Request) -> tuple[str, str | None, str | None]:
+    period = request.query_params.get("period", "all")
+    if period not in PERIODS:
+        period = "all"
+    return period, request.query_params.get("from") or None, request.query_params.get("to") or None
+
+
+def add_period_filter(
+    clauses: list[str],
+    params: list[Any],
+    *,
+    period: str = "all",
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> None:
+    if date_from:
+        params.append(date_from)
+        clauses.append(f"created_at >= ${len(params)}::date")
+    if date_to:
+        params.append(date_to)
+        clauses.append(f"created_at < (${len(params)}::date + INTERVAL '1 day')")
+    if date_from or date_to:
+        return
+    if period == "24h":
+        clauses.append("created_at >= NOW() - INTERVAL '24 hours'")
+    elif period == "7d":
+        clauses.append("created_at >= NOW() - INTERVAL '7 days'")
+    elif period == "30d":
+        clauses.append("created_at >= NOW() - INTERVAL '30 days'")
+
+
+def where_sql(clauses: list[str]) -> str:
+    return "WHERE " + " AND ".join(clauses) if clauses else ""
+
+
+def query_string(period: str, date_from: str | None, date_to: str | None, **extra: str) -> str:
+    query: dict[str, str] = {"period": period}
+    if date_from:
+        query["from"] = date_from
+    if date_to:
+        query["to"] = date_to
+    query.update({key: value for key, value in extra.items() if value})
+    return urlencode(query)
+
+
+def parse_form_body(raw: bytes) -> dict[str, str]:
+    parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+    return {key: values[-1].strip() for key, values in parsed.items()}
+
+
+async def fetch_dashboard_data(*, period: str, date_from: str | None, date_to: str | None) -> dict[str, Any]:
+    db = ensure_pool()
+    clauses: list[str] = []
+    params: list[Any] = []
+    add_period_filter(clauses, params, period=period, date_from=date_from, date_to=date_to)
+    where = where_sql(clauses)
+
+    async with db.acquire() as conn:
         alliance = await conn.fetchrow(
-            """
+            f"""
             SELECT COUNT(*) AS report_count,
                    COALESCE(SUM(own_losses), 0) AS total_losses,
                    COALESCE(SUM(enemy_kills), 0) AS total_kills,
                    COUNT(DISTINCT player_id) AS player_count
             FROM battle_reports
-            WHERE ($1::integer IS NULL OR created_at >= NOW() - ($1 * INTERVAL '1 day'))
+            {where}
             """,
-            period_days,
+            *params,
         )
         leaderboard = await conn.fetch(
-            """
+            f"""
             SELECT player_id,
                    MAX(player_name) AS player_name,
                    COUNT(*) AS report_count,
                    COALESCE(SUM(own_losses), 0) AS total_losses,
                    COALESCE(SUM(enemy_kills), 0) AS total_kills
             FROM battle_reports
-            WHERE ($1::integer IS NULL OR created_at >= NOW() - ($1 * INTERVAL '1 day'))
+            {where}
             GROUP BY player_id
             ORDER BY total_kills DESC, total_losses ASC, report_count DESC, player_name ASC
-            LIMIT 25
+            LIMIT 50
             """,
-            period_days,
+            *params,
         )
         recent = await conn.fetch(
             """
-            SELECT player_name, own_losses, enemy_kills, created_at
+            SELECT id, guild_id, message_id, attachment_id, player_id, player_name,
+                   own_losses, enemy_kills, created_at
             FROM battle_reports
             ORDER BY created_at DESC
             LIMIT 20
             """
         )
-        blacklist_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM battle_report_blacklist"
+        chart = await conn.fetch(
+            f"""
+            SELECT created_at::date AS day,
+                   COUNT(*) AS report_count,
+                   COALESCE(SUM(own_losses), 0) AS total_losses,
+                   COALESCE(SUM(enemy_kills), 0) AS total_kills
+            FROM battle_reports
+            {where}
+            GROUP BY created_at::date
+            ORDER BY day ASC
+            LIMIT 90
+            """,
+            *params,
         )
+        blacklist_count = await conn.fetchval("SELECT COUNT(*) FROM battle_report_blacklist")
 
     return {
         "alliance": dict(alliance),
         "leaderboard": [dict(row) for row in leaderboard],
         "recent": [dict(row) for row in recent],
+        "chart": [dict(row) for row in chart],
         "blacklist_count": int(blacklist_count or 0),
     }
 
 
-def render_dashboard(data: dict[str, Any], period_key: str, period_label: str) -> str:
-    alliance = data["alliance"]
-    total_losses = int(alliance["total_losses"] or 0)
-    total_kills = int(alliance["total_kills"] or 0)
-    cards = [
-        ("Reporty", fmt_number(alliance["report_count"])),
-        ("Hráči", fmt_number(alliance["player_count"])),
-        ("Killy", fmt_number(total_kills)),
-        ("Straty", fmt_number(total_losses)),
-        ("Ratio", fmt_ratio(total_losses, total_kills)),
-        ("Blacklist", fmt_number(data["blacklist_count"])),
+async def fetch_player_data(
+    *, player_id: int, period: str, date_from: str | None, date_to: str | None
+) -> dict[str, Any]:
+    db = ensure_pool()
+    clauses = ["player_id = $1"]
+    params: list[Any] = [player_id]
+    add_period_filter(clauses, params, period=period, date_from=date_from, date_to=date_to)
+    where = where_sql(clauses)
+    async with db.acquire() as conn:
+        summary = await conn.fetchrow(
+            f"""
+            SELECT MAX(player_name) AS player_name,
+                   COUNT(*) AS report_count,
+                   COALESCE(SUM(own_losses), 0) AS total_losses,
+                   COALESCE(SUM(enemy_kills), 0) AS total_kills
+            FROM battle_reports
+            {where}
+            """,
+            *params,
+        )
+        reports = await conn.fetch(
+            f"""
+            SELECT id, guild_id, message_id, attachment_id, player_id, player_name,
+                   own_losses, enemy_kills, created_at
+            FROM battle_reports
+            {where}
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            *params,
+        )
+        chart = await conn.fetch(
+            f"""
+            SELECT created_at::date AS day,
+                   COUNT(*) AS report_count,
+                   COALESCE(SUM(own_losses), 0) AS total_losses,
+                   COALESCE(SUM(enemy_kills), 0) AS total_kills
+            FROM battle_reports
+            {where}
+            GROUP BY created_at::date
+            ORDER BY day ASC
+            LIMIT 90
+            """,
+            *params,
+        )
+    return {"summary": dict(summary), "reports": [dict(row) for row in reports], "chart": [dict(row) for row in chart]}
+
+
+async def fetch_admin_data() -> dict[str, Any]:
+    db = ensure_pool()
+    async with db.acquire() as conn:
+        reports = await conn.fetch(
+            """
+            SELECT id, guild_id, message_id, attachment_id, player_id, player_name,
+                   own_losses, enemy_kills, created_at
+            FROM battle_reports
+            ORDER BY created_at DESC
+            LIMIT 100
+            """
+        )
+        players = await conn.fetch(
+            """
+            SELECT player_id, MAX(player_name) AS player_name,
+                   COUNT(*) AS report_count,
+                   COALESCE(SUM(own_losses), 0) AS total_losses,
+                   COALESCE(SUM(enemy_kills), 0) AS total_kills
+            FROM battle_reports
+            GROUP BY player_id
+            ORDER BY total_kills DESC, player_name ASC
+            LIMIT 200
+            """
+        )
+        blacklist = await conn.fetch(
+            """
+            SELECT guild_id, own_losses, enemy_kills, source_message_id,
+                   blacklisted_by_name, created_at
+            FROM battle_report_blacklist
+            ORDER BY created_at DESC
+            LIMIT 100
+            """
+        )
+    return {"reports": [dict(row) for row in reports], "players": [dict(row) for row in players], "blacklist": [dict(row) for row in blacklist]}
+
+
+def layout(title: str, body: str, *, active: str = "dashboard") -> str:
+    nav = [
+        ("dashboard", "/", "Dashboard"),
+        ("export", "/export.csv", "CSV export"),
+        ("admin", "/admin", "Admin"),
     ]
-
-    card_html = "\n".join(
-        f'<section class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></section>'
-        for label, value in cards
+    nav_html = "".join(
+        f'<a class="nav-link {"active" if key == active else ""}" href="{href}">{label}</a>'
+        for key, href, label in nav
     )
-
-    tabs = "\n".join(
-        f'<a class="tab {"active" if key == period_key else ""}" href="/?period={key}">{esc(label)}</a>'
-        for key, (label, _) in PERIODS.items()
-    )
-
-    rows = []
-    for index, row in enumerate(data["leaderboard"], start=1):
-        losses = int(row["total_losses"] or 0)
-        kills = int(row["total_kills"] or 0)
-        rows.append(
-            "<tr>"
-            f"<td>{index}</td>"
-            f"<td>{esc(row['player_name'])}</td>"
-            f"<td>{fmt_number(kills)}</td>"
-            f"<td>{fmt_number(losses)}</td>"
-            f"<td>{fmt_ratio(losses, kills)}</td>"
-            f"<td>{fmt_number(row['report_count'])}</td>"
-            "</tr>"
-        )
-    leaderboard_html = "\n".join(rows) or (
-        '<tr><td colspan="6" class="empty">Zatiaľ žiadne reporty.</td></tr>'
-    )
-
-    recent_rows = []
-    for row in data["recent"]:
-        losses = int(row["own_losses"] or 0)
-        kills = int(row["enemy_kills"] or 0)
-        created_at = row["created_at"].strftime("%d.%m. %H:%M")
-        recent_rows.append(
-            "<tr>"
-            f"<td>{esc(created_at)}</td>"
-            f"<td>{esc(row['player_name'])}</td>"
-            f"<td>{fmt_number(kills)}</td>"
-            f"<td>{fmt_number(losses)}</td>"
-            f"<td>{fmt_ratio(losses, kills)}</td>"
-            "</tr>"
-        )
-    recent_html = "\n".join(recent_rows) or (
-        '<tr><td colspan="5" class="empty">Zatiaľ žiadne reporty.</td></tr>'
-    )
-
     return f"""<!doctype html>
 <html lang="sk">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GGE Report Dashboard</title>
+  <title>{esc(title)}</title>
   <style>
     :root {{
       color-scheme: dark;
-      --bg: #11131a;
-      --panel: #181b25;
-      --panel-2: #202433;
-      --text: #f4f6fb;
-      --muted: #98a2b3;
-      --line: #30384c;
-      --accent: #f6c453;
-      --good: #7dd87d;
-      --bad: #ff7777;
+      --bg: #080a0f; --panel: rgba(20,24,35,.88); --panel2: rgba(30,36,52,.94);
+      --line: rgba(255,255,255,.10); --text: #f7f3e8; --muted: #9ca3af;
+      --gold: #f5c451; --green: #7dd87d; --red: #ff7575; --shadow: 0 18px 50px rgba(0,0,0,.38);
     }}
     * {{ box-sizing: border-box; }}
     body {{
-      margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: radial-gradient(circle at top left, #23283a 0, #11131a 42rem);
-      color: var(--text);
+      margin:0; min-height:100vh; font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top left, rgba(245,196,81,.18), transparent 34rem),
+                  radial-gradient(circle at 70% 10%, rgba(130,182,255,.11), transparent 28rem),
+                  linear-gradient(180deg, #0b0e15, #080a0f 45%, #06070b);
+      color:var(--text);
     }}
-    main {{
-      width: min(1180px, calc(100% - 32px));
-      margin: 0 auto;
-      padding: 32px 0 48px;
-    }}
-    header {{
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      align-items: flex-end;
-      margin-bottom: 22px;
-    }}
-    h1 {{ margin: 0; font-size: clamp(28px, 5vw, 44px); letter-spacing: 0; }}
-    .subtitle {{ color: var(--muted); margin-top: 8px; }}
-    .tabs {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-    .tab {{
-      color: var(--muted);
-      text-decoration: none;
-      padding: 9px 12px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.03);
-    }}
-    .tab.active {{ color: #1b1605; background: var(--accent); border-color: var(--accent); font-weight: 700; }}
-    .cards {{
-      display: grid;
-      grid-template-columns: repeat(6, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 18px;
-    }}
-    .card {{
-      background: linear-gradient(180deg, var(--panel-2), var(--panel));
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-      min-height: 92px;
-    }}
-    .card span {{ display: block; color: var(--muted); font-size: 13px; }}
-    .card strong {{ display: block; margin-top: 10px; font-size: 24px; white-space: nowrap; }}
-    .grid {{ display: grid; grid-template-columns: 1.4fr 1fr; gap: 18px; align-items: start; }}
-    .panel {{
-      background: rgba(24, 27, 37, 0.9);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: hidden;
-    }}
-    .panel h2 {{ margin: 0; padding: 18px 18px 0; font-size: 19px; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
-    th, td {{ padding: 12px 14px; border-top: 1px solid var(--line); text-align: left; white-space: nowrap; }}
-    th {{ color: var(--muted); font-weight: 600; font-size: 13px; }}
-    td:nth-child(3), td:nth-child(4), td:nth-child(5), td:nth-child(6) {{ text-align: right; }}
-    .empty {{ color: var(--muted); text-align: center !important; padding: 28px; }}
-    footer {{ color: var(--muted); margin-top: 18px; font-size: 13px; }}
-    @media (max-width: 900px) {{
-      header {{ align-items: stretch; flex-direction: column; }}
-      .cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-      .grid {{ grid-template-columns: 1fr; }}
-      .panel {{ overflow-x: auto; }}
-    }}
+    a {{ color:inherit; }}
+    .shell {{ width:min(1320px, calc(100% - 28px)); margin:0 auto; padding:22px 0 48px; }}
+    .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:16px; position:sticky; top:0; z-index:10; padding:12px 0 18px; backdrop-filter:blur(18px); }}
+    .brand {{ display:flex; align-items:center; gap:12px; text-decoration:none; }}
+    .crest {{ width:42px; height:42px; border-radius:12px; display:grid; place-items:center; background:linear-gradient(135deg,#f5c451,#7b4a12); color:#1a1205; box-shadow:var(--shadow); font-size:24px; }}
+    .brand strong {{ display:block; font-size:17px; }} .brand span span {{ color:var(--muted); font-size:13px; }}
+    .nav,.periods,.actions,.mini-form {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
+    .nav-link,.btn,.tab {{ border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); text-decoration:none; border-radius:999px; padding:9px 13px; font-weight:800; font-size:14px; }}
+    .nav-link.active,.btn.primary,.tab.active {{ background:linear-gradient(135deg,var(--gold),#e19b31); color:#1d1405; border-color:rgba(245,196,81,.65); }}
+    .hero {{ display:grid; grid-template-columns:1.2fr .8fr; gap:18px; align-items:stretch; margin:8px 0 18px; }}
+    .hero-card,.panel,.card {{ background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--line); border-radius:22px; box-shadow:var(--shadow); }}
+    .hero-card {{ padding:24px; overflow:hidden; position:relative; }}
+    h1 {{ margin:0; font-size:clamp(30px,5vw,54px); line-height:1.02; letter-spacing:-.04em; }}
+    h2 {{ margin:0 0 12px; font-size:20px; }} h3 {{ margin:0 0 10px; font-size:16px; color:var(--gold); }}
+    .subtitle {{ color:var(--muted); margin-top:10px; max-width:720px; font-size:15px; line-height:1.5; }}
+    .periods {{ margin-top:18px; }} .tab {{ color:var(--muted); }} .tab.active {{ color:#1d1405; }}
+    .filters {{ display:grid; gap:10px; align-content:start; padding:20px; }}
+    label {{ display:grid; gap:6px; color:var(--muted); font-size:13px; font-weight:800; }}
+    input,select {{ width:100%; border:1px solid var(--line); background:rgba(0,0,0,.26); color:var(--text); border-radius:12px; padding:10px 11px; font:inherit; }}
+    button {{ cursor:pointer; }} .danger {{ color:#fff; background:rgba(255,80,80,.18); border-color:rgba(255,80,80,.35); }}
+    .cards {{ display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; margin-bottom:18px; }}
+    .card {{ padding:16px; min-height:105px; }} .card span {{ color:var(--muted); font-size:13px; font-weight:800; }} .card strong {{ display:block; margin-top:10px; font-size:clamp(22px,3vw,31px); white-space:nowrap; }}
+    .grid,.admin-grid {{ display:grid; grid-template-columns:1.35fr .9fr; gap:18px; align-items:start; }}
+    .panel {{ overflow:hidden; }} .panel-head {{ padding:18px 18px 0; display:flex; justify-content:space-between; gap:12px; align-items:center; }} .panel-body {{ padding:18px; }}
+    table {{ width:100%; border-collapse:collapse; }} th,td {{ padding:12px 14px; border-top:1px solid var(--line); text-align:left; white-space:nowrap; }}
+    th {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }} td.num,th.num {{ text-align:right; }} tr:hover td {{ background:rgba(255,255,255,.025); }}
+    .rank {{ width:34px; height:34px; border-radius:11px; display:inline-grid; place-items:center; background:rgba(255,255,255,.06); font-weight:900; }} .rank.top {{ background:linear-gradient(135deg,var(--gold),#a76c18); color:#1b1204; }}
+    .player-link {{ color:var(--text); text-decoration:none; font-weight:900; }} .player-link:hover {{ color:var(--gold); }}
+    .pill {{ display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); border-radius:999px; padding:5px 9px; color:var(--muted); background:rgba(255,255,255,.035); font-size:12px; font-weight:800; }}
+    .good {{ color:var(--green); }} .bad {{ color:var(--red); }} .empty {{ color:var(--muted); text-align:center!important; padding:28px; }}
+    .bars {{ display:flex; align-items:end; gap:6px; height:190px; padding-top:8px; }} .bar-wrap {{ flex:1; display:grid; align-content:end; gap:4px; min-width:8px; }}
+    .bar {{ border-radius:9px 9px 3px 3px; min-height:3px; background:linear-gradient(180deg,var(--gold),#8b5b19); }} .bar.loss {{ background:linear-gradient(180deg,#ff7777,#7f2424); opacity:.72; }}
+    .bar-label {{ color:var(--muted); font-size:10px; writing-mode:vertical-rl; transform:rotate(180deg); justify-self:center; max-height:44px; overflow:hidden; }}
+    .recent-list {{ display:grid; gap:10px; }} .report-item {{ display:grid; grid-template-columns:1fr auto; gap:10px; border-top:1px solid var(--line); padding:12px 0; }} .report-item:first-child {{ border-top:0; }}
+    .report-meta {{ color:var(--muted); font-size:13px; margin-top:3px; }} .mini-form input {{ width:150px; padding:8px 9px; border-radius:10px; font-size:13px; }}
+    .notice {{ margin:0 0 16px; padding:12px 14px; border-radius:14px; background:rgba(125,216,125,.12); border:1px solid rgba(125,216,125,.25); color:#caffe0; }}
+    footer {{ color:var(--muted); margin-top:22px; font-size:13px; }}
+    @media (max-width:1050px) {{ .hero,.grid,.admin-grid {{ grid-template-columns:1fr; }} .cards {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
+    @media (max-width:680px) {{ .shell {{ width:min(100% - 18px,1320px); padding-top:12px; }} .topbar {{ align-items:flex-start; flex-direction:column; }} .cards {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .panel {{ overflow-x:auto; }} th,td {{ padding:10px; }} .report-item {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
 <body>
-  <main>
-    <header>
-      <div>
-        <h1>GGE Report Dashboard</h1>
-        <div class="subtitle">Prehľad štatistík aliancie za: {esc(period_label)}</div>
-      </div>
-      <nav class="tabs">{tabs}</nav>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/"><span class="crest">♛</span><span><strong>GGE Report Dashboard</strong><span>Aliancia · reporty · ratio</span></span></a>
+      <nav class="nav">{nav_html}</nav>
     </header>
-    <div class="cards">{card_html}</div>
-    <div class="grid">
-      <section class="panel">
-        <h2>Leaderboard</h2>
-        <table>
-          <thead><tr><th>#</th><th>Hráč</th><th>Killy</th><th>Straty</th><th>Ratio</th><th>Reporty</th></tr></thead>
-          <tbody>{leaderboard_html}</tbody>
-        </table>
-      </section>
-      <section class="panel">
-        <h2>Posledné reporty</h2>
-        <table>
-          <thead><tr><th>Čas</th><th>Hráč</th><th>Killy</th><th>Straty</th><th>Ratio</th></tr></thead>
-          <tbody>{recent_html}</tbody>
-        </table>
-      </section>
-    </div>
-    <footer>Dashboard je read-only. Admin úpravy zatiaľ robíš cez Discord príkazy.</footer>
+    {body}
+    <footer>Public mód je read-only. Admin akcie sú chránené heslom a zapisujú priamo do rovnakej databázy ako Discord bot.</footer>
   </main>
 </body>
 </html>"""
 
 
-def serialize_dashboard_data(data: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "alliance": data["alliance"],
-        "leaderboard": data["leaderboard"],
-        "recent": [
-            {
-                **row,
-                "created_at": row["created_at"].isoformat(),
-            }
-            for row in data["recent"]
-        ],
-        "blacklist_count": data["blacklist_count"],
+def render_cards(alliance: dict[str, Any], blacklist_count: int) -> str:
+    total_losses = int(alliance["total_losses"] or 0)
+    total_kills = int(alliance["total_kills"] or 0)
+    cards = [
+        ("Reporty", fmt_number(alliance["report_count"])),
+        ("Aktívni hráči", fmt_number(alliance["player_count"])),
+        ("Killy", fmt_number(total_kills)),
+        ("Straty", fmt_number(total_losses)),
+        ("Ratio", fmt_ratio(total_losses, total_kills)),
+        ("Blacklist", fmt_number(blacklist_count)),
+    ]
+    return "".join(f'<section class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></section>' for label, value in cards)
+
+
+def render_period_tabs(period: str, date_from: str | None, date_to: str | None, base: str = "/") -> str:
+    return "".join(
+        f'<a class="tab {"active" if key == period and not (date_from or date_to) else ""}" href="{base}?period={key}">{esc(label)}</a>'
+        for key, label in PERIODS.items()
+    )
+
+
+def render_filter_form(period: str, date_from: str | None, date_to: str | None, base: str = "/") -> str:
+    options = "".join(f'<option value="{key}" {"selected" if key == period else ""}>{esc(label)}</option>' for key, label in PERIODS.items())
+    return f"""
+    <form class="filters hero-card" action="{esc(base)}" method="get">
+      <h3>Vlastný filter</h3>
+      <label>Obdobie<select name="period">{options}</select></label>
+      <label>Od dátumu<input type="date" name="from" value="{esc(date_from or '')}"></label>
+      <label>Do dátumu<input type="date" name="to" value="{esc(date_to or '')}"></label>
+      <button class="btn primary" type="submit">Použiť filter</button>
+    </form>
+    """
+
+
+def render_chart(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<div class="empty">Zatiaľ žiadne dáta pre graf.</div>'
+    max_value = max(max(int(row["total_kills"] or 0), int(row["total_losses"] or 0)) for row in rows) or 1
+    bars = []
+    for row in rows[-30:]:
+        kills = int(row["total_kills"] or 0)
+        losses = int(row["total_losses"] or 0)
+        day = row["day"].strftime("%d.%m.") if hasattr(row["day"], "strftime") else str(row["day"])
+        bars.append(
+            f"""
+            <div class="bar-wrap" title="{esc(day)} · killy {fmt_number(kills)} · straty {fmt_number(losses)}">
+              <div class="bar" style="height:{max(3, round((kills / max_value) * 170))}px"></div>
+              <div class="bar loss" style="height:{max(3, round((losses / max_value) * 170))}px"></div>
+              <span class="bar-label">{esc(day)}</span>
+            </div>
+            """
+        )
+    return f'<div class="bars">{"".join(bars)}</div><div class="report-meta">Zlatá = killy, červená = straty.</div>'
+
+
+def render_leaderboard(rows: list[dict[str, Any]], period: str, date_from: str | None, date_to: str | None) -> str:
+    table_rows = []
+    qs = query_string(period, date_from, date_to)
+    for index, row in enumerate(rows, start=1):
+        losses = int(row["total_losses"] or 0)
+        kills = int(row["total_kills"] or 0)
+        ratio = ratio_score(losses, kills)
+        rank_class = "rank top" if index <= 3 else "rank"
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(index, str(index))
+        table_rows.append(
+            "<tr>"
+            f'<td><span class="{rank_class}">{medal}</span></td>'
+            f'<td><a class="player-link" href="/player/{int(row["player_id"])}?{qs}">{esc(row["player_name"])}</a></td>'
+            f'<td class="num">{fmt_number(kills)}</td>'
+            f'<td class="num">{fmt_number(losses)}</td>'
+            f'<td class="num {"good" if ratio >= 5 else "bad" if ratio < 2 else ""}">{fmt_ratio(losses, kills)}</td>'
+            f'<td class="num">{fmt_number(row["report_count"])}</td>'
+            "</tr>"
+        )
+    body = "\n".join(table_rows) or '<tr><td colspan="6" class="empty">Zatiaľ žiadne reporty.</td></tr>'
+    return f"""
+    <table>
+      <thead><tr><th>#</th><th>Hráč</th><th class="num">Killy</th><th class="num">Straty</th><th class="num">Ratio</th><th class="num">Reporty</th></tr></thead>
+      <tbody>{body}</tbody>
+    </table>
+    """
+
+
+def render_recent(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<div class="empty">Zatiaľ žiadne reporty.</div>'
+    items = []
+    for row in rows:
+        losses = int(row["own_losses"] or 0)
+        kills = int(row["enemy_kills"] or 0)
+        created_at = row["created_at"].strftime("%d.%m. %H:%M")
+        items.append(
+            f"""
+            <div class="report-item">
+              <div>
+                <a class="player-link" href="/player/{int(row["player_id"])}">{esc(row["player_name"])}</a>
+                <div class="report-meta">{esc(created_at)} · msg {int(row["message_id"])}</div>
+              </div>
+              <div class="actions">
+                <span class="pill">⚔️ {fmt_number(kills)}</span>
+                <span class="pill">🛡️ {fmt_number(losses)}</span>
+                <span class="pill">Ratio {fmt_ratio(losses, kills)}</span>
+              </div>
+            </div>
+            """
+        )
+    return f'<div class="recent-list">{"".join(items)}</div>'
+
+
+def render_dashboard(data: dict[str, Any], period: str, date_from: str | None, date_to: str | None) -> str:
+    label = period_label(period, date_from, date_to)
+    body = f"""
+    <section class="hero">
+      <div class="hero-card">
+        <h1>Aliancia pod kontrolou</h1>
+        <p class="subtitle">Prehľad killov, strát, ratio, reportov a aktivity hráčov za <strong>{esc(label)}</strong>.</p>
+        <div class="periods">{render_period_tabs(period, date_from, date_to)}</div>
+      </div>
+      {render_filter_form(period, date_from, date_to)}
+    </section>
+    <section class="cards">{render_cards(data["alliance"], data["blacklist_count"])}</section>
+    <section class="grid">
+      <div class="panel">
+        <div class="panel-head"><h2>Leaderboard</h2><a class="btn" href="/export.csv?{query_string(period, date_from, date_to)}">Stiahnuť CSV</a></div>
+        {render_leaderboard(data["leaderboard"], period, date_from, date_to)}
+      </div>
+      <div class="panel"><div class="panel-head"><h2>Vývoj aktivity</h2></div><div class="panel-body">{render_chart(data["chart"])}</div></div>
+    </section>
+    <section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Posledné reporty</h2><span class="pill">read-only</span></div><div class="panel-body">{render_recent(data["recent"])}</div></section>
+    """
+    return layout("GGE Report Dashboard", body)
+
+
+def render_player_page(player_id: int, data: dict[str, Any], period: str, date_from: str | None, date_to: str | None) -> str:
+    summary = data["summary"]
+    player_name = summary["player_name"] or f"Hráč {player_id}"
+    cards = {
+        "report_count": summary["report_count"],
+        "player_count": 1 if int(summary["report_count"] or 0) else 0,
+        "total_losses": summary["total_losses"],
+        "total_kills": summary["total_kills"],
     }
+    body = f"""
+    <section class="hero">
+      <div class="hero-card">
+        <a class="tab" href="/?{query_string(period, date_from, date_to)}">← Späť na dashboard</a>
+        <h1 style="margin-top:16px">{esc(player_name)}</h1>
+        <p class="subtitle">Detail hráča za <strong>{esc(period_label(period, date_from, date_to))}</strong>. Player ID: <code>{int(player_id)}</code></p>
+        <div class="periods">{render_period_tabs(period, date_from, date_to, f"/player/{int(player_id)}")}</div>
+      </div>
+      {render_filter_form(period, date_from, date_to, f"/player/{int(player_id)}")}
+    </section>
+    <section class="cards">{render_cards(cards, 0)}</section>
+    <section class="grid">
+      <div class="panel"><div class="panel-head"><h2>Reporty hráča</h2></div><div class="panel-body">{render_recent(data["reports"])}</div></div>
+      <div class="panel"><div class="panel-head"><h2>Trend hráča</h2></div><div class="panel-body">{render_chart(data["chart"])}</div></div>
+    </section>
+    """
+    return layout(f"{player_name} · GGE Report Dashboard", body)
+
+
+def action_form(action: str, label: str, fields: str, button_class: str = "btn") -> str:
+    return f'<form class="mini-form" method="post" action="/admin/{esc(action)}">{fields}<button class="{button_class}" type="submit">{esc(label)}</button></form>'
+
+
+def render_admin(data: dict[str, Any], message: str | None = None) -> str:
+    report_rows = []
+    for row in data["reports"]:
+        losses = int(row["own_losses"] or 0)
+        kills = int(row["enemy_kills"] or 0)
+        msg_id = int(row["message_id"])
+        player_id = int(row["player_id"])
+        release_fields = f'<input type="hidden" name="message_id" value="{msg_id}">'
+        assign_fields = (
+            f'<input type="hidden" name="message_id" value="{msg_id}">'
+            '<input name="player_id" inputmode="numeric" placeholder="player id">'
+            '<input name="player_name" placeholder="meno hráča">'
+        )
+        report_rows.append(
+            "<tr>"
+            f"<td>{row['created_at'].strftime('%d.%m. %H:%M')}</td>"
+            f"<td>{esc(row['player_name'])}<div class='report-meta'>{player_id}</div></td>"
+            f"<td class='num'>{fmt_number(kills)}</td><td class='num'>{fmt_number(losses)}</td><td class='num'>{fmt_ratio(losses, kills)}</td>"
+            f"<td class='num'>{msg_id}</td>"
+            f"<td>{action_form('release', 'Release', release_fields)}{action_form('blacklist', 'Blacklist', release_fields, 'btn danger')}{action_form('assign', 'Assign', assign_fields, 'btn primary')}</td>"
+            "</tr>"
+        )
+    report_table = "\n".join(report_rows) or '<tr><td colspan="7" class="empty">Žiadne reporty.</td></tr>'
+    player_options = "".join(
+        f'<option value="{int(row["player_id"])}">{esc(row["player_name"])} · {fmt_number(row["total_kills"])} killov</option>'
+        for row in data["players"]
+    )
+    blacklist_rows = "\n".join(
+        "<tr>"
+        f"<td>{row['created_at'].strftime('%d.%m. %H:%M')}</td>"
+        f"<td class='num'>{fmt_number(row['enemy_kills'])}</td><td class='num'>{fmt_number(row['own_losses'])}</td>"
+        f"<td>{esc(row['blacklisted_by_name'] or 'admin')}</td><td class='num'>{int(row['source_message_id'] or 0)}</td>"
+        "</tr>"
+        for row in data["blacklist"]
+    ) or '<tr><td colspan="5" class="empty">Blacklist je prázdny.</td></tr>'
+    notice = f'<div class="notice">{esc(message)}</div>' if message else ""
+    body = f"""
+    <section class="hero-card" style="margin-bottom:18px"><h1>Admin panel</h1><p class="subtitle">Release, blacklist, assign a reset priamo z webu. Toto je chránené dashboard heslom.</p></section>
+    {notice}
+    <section class="admin-grid">
+      <div class="panel"><div class="panel-head"><h2>Rýchle akcie</h2></div><div class="panel-body">
+        <h3>Reset hráča</h3>
+        <form class="mini-form" method="post" action="/admin/reset"><select name="player_id" required>{player_options}</select><select name="period"><option value="all">Celé obdobie</option><option value="30d">30 dní</option><option value="7d">7 dní</option><option value="24h">24h</option></select><button class="btn danger" type="submit">Resetnúť</button></form>
+        <h3 style="margin-top:22px">Manuálne podľa message ID</h3>
+        {action_form('release', 'Release report', '<input name="message_id" inputmode="numeric" placeholder="message id">')}
+        {action_form('blacklist', 'Blacklist report', '<input name="message_id" inputmode="numeric" placeholder="message id">', 'btn danger')}
+      </div></div>
+      <div class="panel"><div class="panel-head"><h2>Blacklist</h2></div><table><thead><tr><th>Čas</th><th class="num">Killy</th><th class="num">Straty</th><th>Admin</th><th class="num">Message</th></tr></thead><tbody>{blacklist_rows}</tbody></table></div>
+    </section>
+    <section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Report history</h2><a class="btn" href="/admin/reports.csv">CSV reporty</a></div><table><thead><tr><th>Čas</th><th>Hráč</th><th class="num">Killy</th><th class="num">Straty</th><th class="num">Ratio</th><th class="num">Message</th><th>Akcie</th></tr></thead><tbody>{report_table}</tbody></table></section>
+    """
+    return layout("Admin · GGE Report Dashboard", body, active="admin")
+
+
+async def release_by_message(message_id: int) -> int:
+    db = ensure_pool()
+    status = await db.execute("DELETE FROM battle_reports WHERE message_id = $1", message_id)
+    return int(status.rsplit(" ", 1)[-1])
+
+
+async def assign_by_message(message_id: int, player_id: int, player_name: str) -> int:
+    db = ensure_pool()
+    status = await db.execute("UPDATE battle_reports SET player_id = $2, player_name = $3 WHERE message_id = $1", message_id, player_id, player_name)
+    return int(status.rsplit(" ", 1)[-1])
+
+
+async def blacklist_by_message(message_id: int, admin_name: str) -> tuple[int, int]:
+    db = ensure_pool()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch("SELECT DISTINCT guild_id, own_losses, enemy_kills FROM battle_reports WHERE message_id = $1", message_id)
+            inserted = 0
+            for row in rows:
+                status = await conn.execute(
+                    """
+                    INSERT INTO battle_report_blacklist (
+                        guild_id, own_losses, enemy_kills,
+                        source_message_id, blacklisted_by_name
+                    ) VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (guild_id, own_losses, enemy_kills) DO NOTHING
+                    """,
+                    int(row["guild_id"]),
+                    int(row["own_losses"]),
+                    int(row["enemy_kills"]),
+                    message_id,
+                    admin_name,
+                )
+                if status == "INSERT 0 1":
+                    inserted += 1
+            status = await conn.execute("DELETE FROM battle_reports WHERE message_id = $1", message_id)
+            return int(status.rsplit(" ", 1)[-1]), inserted
+
+
+async def reset_player(player_id: int, period: str) -> int:
+    db = ensure_pool()
+    clauses = ["player_id = $1"]
+    params: list[Any] = [player_id]
+    add_period_filter(clauses, params, period=period)
+    status = await db.execute(f"DELETE FROM battle_reports {where_sql(clauses)}", *params)
+    return int(status.rsplit(" ", 1)[-1])
+
+
+def csv_response(filename: str, headers: list[str], rows: list[list[Any]]) -> Response:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+def admin_redirect(message: str) -> RedirectResponse:
+    return RedirectResponse(f"/admin?{urlencode({'message': message})}", status_code=303)
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request, period: str = "all", user: str = Depends(require_auth)):
-    period_key, period_label, period_days = normalize_period(period)
-    data = await fetch_dashboard_data(period_days)
-    return HTMLResponse(render_dashboard(data, period_key, period_label))
+async def index(request: Request):
+    period, date_from, date_to = get_filters(request)
+    data = await fetch_dashboard_data(period=period, date_from=date_from, date_to=date_to)
+    return HTMLResponse(render_dashboard(data, period, date_from, date_to))
+
+
+@app.get("/player/{player_id}", response_class=HTMLResponse)
+async def player_detail(player_id: int, request: Request):
+    period, date_from, date_to = get_filters(request)
+    data = await fetch_player_data(player_id=player_id, period=period, date_from=date_from, date_to=date_to)
+    return HTMLResponse(render_player_page(player_id, data, period, date_from, date_to))
+
+
+@app.get("/export.csv")
+async def export_csv(request: Request):
+    period, date_from, date_to = get_filters(request)
+    data = await fetch_dashboard_data(period=period, date_from=date_from, date_to=date_to)
+    rows = []
+    for index, row in enumerate(data["leaderboard"], start=1):
+        losses = int(row["total_losses"] or 0)
+        kills = int(row["total_kills"] or 0)
+        rows.append([index, int(row["player_id"]), row["player_name"], int(row["report_count"] or 0), kills, losses, fmt_ratio(losses, kills)])
+    return csv_response("gge-leaderboard.csv", ["rank", "player_id", "player_name", "reports", "kills", "losses", "ratio"], rows)
 
 
 @app.get("/api/summary")
-async def api_summary(period: str = "all", user: str = Depends(require_auth)):
-    period_key, period_label, period_days = normalize_period(period)
-    data = await fetch_dashboard_data(period_days)
+async def api_summary(request: Request):
+    period, date_from, date_to = get_filters(request)
+    data = await fetch_dashboard_data(period=period, date_from=date_from, date_to=date_to)
     return JSONResponse(
         {
-            "period": {"key": period_key, "label": period_label, "days": period_days},
-            "data": serialize_dashboard_data(data),
+            "period": {"key": period, "label": period_label(period, date_from, date_to), "from": date_from, "to": date_to},
+            "data": {
+                "alliance": data["alliance"],
+                "leaderboard": data["leaderboard"],
+                "recent": [{**row, "created_at": row["created_at"].isoformat()} for row in data["recent"]],
+                "blacklist_count": data["blacklist_count"],
+            },
         }
     )
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin(message: str | None = None, user: str = Depends(require_auth)):
+    data = await fetch_admin_data()
+    return HTMLResponse(render_admin(data, message))
+
+
+@app.get("/admin/reports.csv")
+async def admin_reports_csv(user: str = Depends(require_auth)):
+    data = await fetch_admin_data()
+    rows = [
+        [
+            row["created_at"].isoformat(),
+            int(row["guild_id"]),
+            int(row["message_id"]),
+            int(row["attachment_id"]),
+            int(row["player_id"]),
+            row["player_name"],
+            int(row["enemy_kills"]),
+            int(row["own_losses"]),
+            fmt_ratio(int(row["own_losses"]), int(row["enemy_kills"])),
+        ]
+        for row in data["reports"]
+    ]
+    return csv_response("gge-reports.csv", ["created_at", "guild_id", "message_id", "attachment_id", "player_id", "player_name", "kills", "losses", "ratio"], rows)
+
+
+@app.post("/admin/release")
+async def admin_release(request: Request, user: str = Depends(require_auth)):
+    form = parse_form_body(await request.body())
+    deleted = await release_by_message(int(form["message_id"]))
+    return admin_redirect(f"Release hotový. Vymazané reporty: {deleted}.")
+
+
+@app.post("/admin/assign")
+async def admin_assign(request: Request, user: str = Depends(require_auth)):
+    form = parse_form_body(await request.body())
+    updated = await assign_by_message(int(form["message_id"]), int(form["player_id"]), form["player_name"])
+    return admin_redirect(f"Assign hotový. Presunuté reporty: {updated}.")
+
+
+@app.post("/admin/blacklist")
+async def admin_blacklist(request: Request, user: str = Depends(require_auth)):
+    form = parse_form_body(await request.body())
+    deleted, inserted = await blacklist_by_message(int(form["message_id"]), user)
+    return admin_redirect(f"Blacklist hotový. Vymazané reporty: {deleted}. Nové blacklist záznamy: {inserted}.")
+
+
+@app.post("/admin/reset")
+async def admin_reset(request: Request, user: str = Depends(require_auth)):
+    form = parse_form_body(await request.body())
+    deleted = await reset_player(int(form["player_id"]), form.get("period", "all"))
+    return admin_redirect(f"Reset hotový. Vymazané reporty: {deleted}.")
