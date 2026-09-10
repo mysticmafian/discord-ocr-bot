@@ -44,6 +44,32 @@ POWER_PERIODS: dict[str, tuple[str, timedelta]] = {
     "7d": ("7 dní", timedelta(days=7)),
     "30d": ("30 dní", timedelta(days=30)),
 }
+EVENT_TYPES: dict[str, dict[str, str]] = {
+    "nomadi": {
+        "title": "Nomádi",
+        "nav": "Nomádi",
+        "tracker_key": "player_event_nomad_history",
+        "emoji": "🏕️",
+    },
+    "samuraji": {
+        "title": "Samuraji",
+        "nav": "Samuraji",
+        "tracker_key": "player_event_samurai_history",
+        "emoji": "⛩️",
+    },
+    "cudzinci": {
+        "title": "Cudzinci",
+        "nav": "Cudzinci",
+        "tracker_key": "player_event_war_realms_history",
+        "emoji": "🛡️",
+    },
+    "vrany": {
+        "title": "Vrany",
+        "nav": "Vrany",
+        "tracker_key": "player_event_bloodcrow_history",
+        "emoji": "🩸",
+    },
+}
 ADMIN_REPORTS_PER_PAGE = 10
 
 security = HTTPBasic()
@@ -179,6 +205,47 @@ async def ensure_dashboard_tables() -> None:
             ON tracker_loot_snapshots (server, player_id, recorded_at DESC)
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracker_event_snapshots (
+                server TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                player_id BIGINT NOT NULL,
+                player_name TEXT NOT NULL,
+                alliance_name TEXT NOT NULL,
+                event_points BIGINT NOT NULL,
+                recorded_at TIMESTAMPTZ NOT NULL,
+                source TEXT NOT NULL DEFAULT 'tracker',
+                PRIMARY KEY (server, event_key, player_id, recorded_at)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS tracker_event_snapshots_event_player_time_idx
+            ON tracker_event_snapshots (server, event_key, player_id, recorded_at DESC)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracker_event_occurrences (
+                server TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                started_at TIMESTAMPTZ NOT NULL,
+                ended_at TIMESTAMPTZ NOT NULL,
+                sample_player_id BIGINT,
+                sample_points BIGINT NOT NULL DEFAULT 0,
+                synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (server, event_key, started_at, ended_at)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS tracker_event_occurrences_event_time_idx
+            ON tracker_event_occurrences (server, event_key, started_at DESC)
+            """
+        )
 
 
 def tracker_json(path: str) -> Any:
@@ -233,13 +300,35 @@ async def sync_tracker_power() -> dict[str, int]:
     players = detail.get("players") or []
     history: list[dict[str, Any]] = []
     loot_history: list[dict[str, Any]] = []
+    event_histories: dict[str, list[dict[str, Any]]] = {
+        config["tracker_key"]: [] for config in EVENT_TYPES.values()
+    }
+    event_occurrences: dict[str, list[dict[str, Any]]] = {
+        config["tracker_key"]: [] for config in EVENT_TYPES.values()
+    }
     try:
         stats = await tracker_json_async(f"/statistics/alliance/{alliance_id}")
         points = stats.get("points") or {}
         history = points.get("player_might_history") or []
         loot_history = points.get("player_loot_history") or []
+        for event_key in event_histories:
+            event_histories[event_key] = points.get(event_key) or []
     except (urlerror.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"[DASHBOARD] Tracker history sync failed: {type(exc).__name__}: {exc}")
+
+    sample_player_id = next((to_int(player.get("player_id")) for player in players if to_int(player.get("player_id"))), 0)
+    if sample_player_id:
+        for event_key in event_occurrences:
+            try:
+                occurrence_data = await tracker_json_async(
+                    f"/statistics/player/{sample_player_id}/{event_key}/occurrences"
+                )
+                event_occurrences[event_key] = occurrence_data.get("occurrences") or []
+            except (urlerror.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
+                print(
+                    f"[DASHBOARD] Tracker occurrence sync failed for {event_key}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     current_time = utc_now()
     async with db.acquire() as conn:
@@ -370,7 +459,70 @@ async def sync_tracker_power() -> dict[str, int]:
                     loot_points,
                     recorded_at,
                 )
-    return {"players": len(players), "history": len(history), "loot_history": len(loot_history)}
+
+            for event_key, event_history in event_histories.items():
+                for point in event_history:
+                    player_id = to_int(point.get("player_id"))
+                    recorded_at = parse_tracker_time(point.get("date"))
+                    event_points = to_int(point.get("point"), -1)
+                    if not player_id or recorded_at is None or event_points < 0:
+                        continue
+                    await conn.execute(
+                        """
+                        INSERT INTO tracker_event_snapshots (
+                            server, event_key, player_id, player_name, alliance_name,
+                            event_points, recorded_at, source
+                        ) VALUES (
+                            $1, $2, $3,
+                            COALESCE((SELECT player_name FROM tracker_players WHERE server = $1 AND player_id = $3), $4),
+                            $5, $6, $7, 'history'
+                        )
+                        ON CONFLICT (server, event_key, player_id, recorded_at) DO UPDATE SET
+                            event_points = EXCLUDED.event_points,
+                            player_name = EXCLUDED.player_name,
+                            alliance_name = EXCLUDED.alliance_name,
+                            source = EXCLUDED.source
+                        """,
+                        TRACKER_SERVER,
+                        event_key,
+                        player_id,
+                        str(player_id),
+                        detail.get("alliance_name") or ALLIANCE_NAME,
+                        event_points,
+                        recorded_at,
+                    )
+
+            for event_key, occurrences in event_occurrences.items():
+                for occurrence in occurrences:
+                    started_at = parse_tracker_time(occurrence.get("started_at"))
+                    ended_at = parse_tracker_time(occurrence.get("ended_at"))
+                    if started_at is None or ended_at is None:
+                        continue
+                    await conn.execute(
+                        """
+                        INSERT INTO tracker_event_occurrences (
+                            server, event_key, started_at, ended_at,
+                            sample_player_id, sample_points, synced_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                        ON CONFLICT (server, event_key, started_at, ended_at) DO UPDATE SET
+                            sample_player_id = EXCLUDED.sample_player_id,
+                            sample_points = EXCLUDED.sample_points,
+                            synced_at = NOW()
+                        """,
+                        TRACKER_SERVER,
+                        event_key,
+                        started_at,
+                        ended_at,
+                        sample_player_id,
+                        to_int(occurrence.get("point")),
+                    )
+    return {
+        "players": len(players),
+        "history": len(history),
+        "loot_history": len(loot_history),
+        "event_history": sum(len(points) for points in event_histories.values()),
+        "event_occurrences": sum(len(points) for points in event_occurrences.values()),
+    }
 
 
 async def tracker_sync_loop() -> None:
@@ -380,7 +532,9 @@ async def tracker_sync_loop() -> None:
             print(
                 f"[DASHBOARD] Synced GGE Tracker power: {result['players']} players, "
                 f"{result['history']} power history points, "
-                f"{result.get('loot_history', 0)} loot history points"
+                f"{result.get('loot_history', 0)} loot history points, "
+                f"{result.get('event_history', 0)} event history points, "
+                f"{result.get('event_occurrences', 0)} event occurrences"
             )
         except asyncio.CancelledError:
             raise
@@ -464,6 +618,28 @@ def query_string(period: str, date_from: str | None, date_to: str | None, **extr
         query["to"] = date_to
     query.update({key: value for key, value in extra.items() if value})
     return urlencode(query)
+
+
+def sort_header(
+    label: str,
+    *,
+    base: str,
+    params: dict[str, str],
+    key: str,
+    active_sort: str,
+    direction: str,
+    numeric: bool = False,
+) -> str:
+    next_dir = "asc" if active_sort == key and direction == "desc" else "desc"
+    merged = {**params, "sort": key, "dir": next_dir}
+    arrow = " ↓" if active_sort == key and direction == "desc" else " ↑" if active_sort == key else ""
+    active = " active" if active_sort == key else ""
+    th_class = ' class="num"' if numeric else ""
+    return (
+        f"<th{th_class}>"
+        f'<a class="sort-link{active}" href="{esc(base)}?{urlencode(merged)}">{esc(label)}{esc(arrow)}</a>'
+        "</th>"
+    )
 
 
 def parse_form_body(raw: bytes) -> dict[str, str]:
@@ -656,6 +832,10 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
         ("dashboard", "/", "Dashboard"),
         ("might", "/?tab=moc", "Moc"),
         ("loot", "/?tab=rabovanie", "Rabovanie"),
+        ("nomadi", "/?tab=nomadi", "Nomádi"),
+        ("samuraji", "/?tab=samuraji", "Samuraji"),
+        ("cudzinci", "/?tab=cudzinci", "Cudzinci"),
+        ("vrany", "/?tab=vrany", "Vrany"),
         ("export", "/export.csv", "CSV export"),
         ("admin", "/admin", "Admin"),
     ]
@@ -710,6 +890,9 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .panel {{ overflow:hidden; }} .panel-head {{ padding:18px 18px 0; display:flex; justify-content:space-between; gap:12px; align-items:center; }} .panel-body {{ padding:18px; }}
     table {{ width:100%; border-collapse:collapse; }} th,td {{ padding:12px 14px; border-top:1px solid var(--line); text-align:left; white-space:nowrap; }}
     th {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }} td.num,th.num {{ text-align:right; }} tr:hover td {{ background:rgba(255,255,255,.025); }}
+    .sort-link {{ color:var(--muted); text-decoration:none; display:inline-flex; align-items:center; gap:5px; }}
+    .sort-link.active {{ color:var(--gold); }}
+    .sort-link:hover {{ color:var(--text); }}
     .rank {{ width:34px; height:34px; border-radius:11px; display:inline-grid; place-items:center; background:rgba(255,255,255,.06); font-weight:900; }} .rank.top {{ background:linear-gradient(135deg,var(--gold),#a76c18); color:#1b1204; }}
     .player-link {{ color:var(--text); text-decoration:none; font-weight:900; }} .player-link:hover {{ color:var(--gold); }}
     .pill {{ display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); border-radius:999px; padding:5px 9px; color:var(--muted); background:rgba(255,255,255,.035); font-size:12px; font-weight:800; }}
@@ -815,8 +998,18 @@ def power_period(request: Request) -> str:
 def power_sort(request: Request) -> tuple[str, str]:
     sort = request.query_params.get("sort", "moc")
     direction = request.query_params.get("dir", "desc")
-    if sort not in {"moc", "zmena"}:
+    if sort not in {"meno", "moc", "zmena", "level", "update"}:
         sort = "moc"
+    if direction not in {"asc", "desc"}:
+        direction = "desc"
+    return sort, direction
+
+
+def table_sort(request: Request, allowed: set[str], default: str = "score") -> tuple[str, str]:
+    sort = request.query_params.get("sort", default)
+    direction = request.query_params.get("dir", "desc")
+    if sort not in allowed:
+        sort = default
     if direction not in {"asc", "desc"}:
         direction = "desc"
     return sort, direction
@@ -920,6 +1113,10 @@ def fmt_signed(value: int) -> str:
     return f"{sign}{fmt_number(value)}"
 
 
+def fmt_dt(value: Any) -> str:
+    return value.strftime("%d.%m. %H:%M") if hasattr(value, "strftime") else "—"
+
+
 def render_power_tabs(
     period: str,
     player_id: int | None = None,
@@ -993,9 +1190,21 @@ def render_power_page(data: dict[str, Any]) -> str:
         total_delta += delta
         prepared_rows.append({**row, "_current": current, "_delta": delta})
 
-    sort_field = "_delta" if sort == "zmena" else "_current"
+    sort_field = {
+        "meno": "player_name",
+        "level": "legendary_level",
+        "update": "tracker_updated_at",
+        "zmena": "_delta",
+    }.get(sort, "_current")
     prepared_rows.sort(
-        key=lambda row: (int(row[sort_field]), str(row["player_name"]).lower()),
+        key=lambda row: (
+            str(row[sort_field]).lower()
+            if sort == "meno"
+            else row[sort_field] or row["synced_at"] or datetime.min.replace(tzinfo=timezone.utc)
+            if sort == "update"
+            else int(row[sort_field] or 0),
+            str(row["player_name"]).lower(),
+        ),
         reverse=direction == "desc",
     )
 
@@ -1031,15 +1240,13 @@ def render_power_page(data: dict[str, Any]) -> str:
         <div class="periods">{render_power_tabs(period, sort=sort, direction=direction)}</div>
       </div>
       <div class="filters hero-card">
-        <h3>Zoradenie</h3>
-        <div class="periods" style="margin-top:0">{render_power_sort_controls(period, sort, direction)}</div>
-        <h3 style="margin-top:18px">Zdroj</h3>
+        <h3>Zdroj</h3>
         <p class="subtitle" style="margin:0">Server: <strong>{esc(TRACKER_SERVER)}</strong><br>Aliancia: <strong>{esc(ALLIANCE_NAME)}</strong><br>Interval syncu: približne každých {fmt_number(TRACKER_SYNC_INTERVAL_SECONDS // 60)} min.</p>
       </div>
     </section>
     <section class="cards" style="grid-template-columns:repeat(3,minmax(0,1fr))">{cards_html}</section>
     <section class="panel"><div class="panel-head"><h2>Členovia podľa power</h2><span class="pill">{esc(period_label_text)}</span></div>
-      <table><thead><tr><th>#</th><th>Hráč</th><th class="num">Power</th><th class="num">Zmena</th><th class="num">Level</th><th>Update</th></tr></thead><tbody>{body_rows}</tbody></table>
+      <table><thead><tr><th>#</th>{sort_header("Hráč", base="/", params={"tab": "moc", "period": period}, key="meno", active_sort=sort, direction=direction)}{sort_header("Power", base="/", params={"tab": "moc", "period": period}, key="moc", active_sort=sort, direction=direction, numeric=True)}{sort_header("Zmena", base="/", params={"tab": "moc", "period": period}, key="zmena", active_sort=sort, direction=direction, numeric=True)}{sort_header("Level", base="/", params={"tab": "moc", "period": period}, key="level", active_sort=sort, direction=direction, numeric=True)}{sort_header("Update", base="/", params={"tab": "moc", "period": period}, key="update", active_sort=sort, direction=direction)}</tr></thead><tbody>{body_rows}</tbody></table>
     </section>
     """
     return layout("Moc · ROYAL SOLDIERS", body, active="might")
@@ -1080,7 +1287,7 @@ def render_power_player_page(player_id: int, data: dict[str, Any]) -> str:
     return layout(f"{player['player_name']} · Moc", body, active="might")
 
 
-async def fetch_loot_data() -> dict[str, Any]:
+async def fetch_loot_data(sort: str = "this_week", direction: str = "desc") -> dict[str, Any]:
     db = ensure_pool()
     async with db.acquire() as conn:
         rows = await conn.fetch(
@@ -1120,20 +1327,39 @@ async def fetch_loot_data() -> dict[str, Any]:
             TRACKER_SERVER,
             ALLIANCE_NAME,
         )
-    return {"players": [dict(row) for row in rows], "last_sync": last_sync}
+    return {"players": [dict(row) for row in rows], "last_sync": last_sync, "sort": sort, "direction": direction}
 
 
 def render_loot_page(data: dict[str, Any]) -> str:
     rows = []
     total_this_week = 0
-    total_last_week = 0
-    for index, row in enumerate(data["players"], start=1):
+    sort = data.get("sort", "this_week")
+    direction = data.get("direction", "desc")
+    prepared_rows = []
+    for row in data["players"]:
         this_week = int(row["this_week_loot"] or 0)
-        last_week = int(row["last_week_loot"] or 0)
-        diff = this_week - last_week
         total_this_week += this_week
-        total_last_week += last_week
-        diff_class = "good" if diff > 0 else "bad" if diff < 0 else ""
+        prepared_rows.append({**row, "_this_week": this_week})
+
+    sort_field = {
+        "meno": "player_name",
+        "level": "legendary_level",
+        "update": "tracker_updated_at",
+    }.get(sort, "_this_week")
+    prepared_rows.sort(
+        key=lambda row: (
+            str(row[sort_field]).lower()
+            if sort == "meno"
+            else row[sort_field] or row["synced_at"] or datetime.min.replace(tzinfo=timezone.utc)
+            if sort == "update"
+            else int(row[sort_field] or 0),
+            str(row["player_name"]).lower(),
+        ),
+        reverse=direction == "desc",
+    )
+
+    for index, row in enumerate(prepared_rows, start=1):
+        this_week = int(row["_this_week"])
         updated_at = row["tracker_updated_at"] or row["synced_at"]
         updated_label = updated_at.strftime("%d.%m. %H:%M") if hasattr(updated_at, "strftime") else "—"
         rows.append(
@@ -1141,39 +1367,224 @@ def render_loot_page(data: dict[str, Any]) -> str:
             f"<td>{index}</td>"
             f"<td>{esc(row['player_name'])}</td>"
             f'<td class="num">{fmt_number(this_week)}</td>'
-            f'<td class="num">{fmt_number(last_week)}</td>'
-            f'<td class="num {diff_class}">{fmt_signed(diff)}</td>'
             f'<td class="num">{int(row["level"] or 0)}/{int(row["legendary_level"] or 0)}</td>'
             f"<td>{esc(updated_label)}</td>"
             "</tr>"
         )
-    body_rows = "\n".join(rows) or '<tr><td colspan="7" class="empty">Zatiaľ nemám dáta o rabovaní z GGE Trackeru. Skús refresh o chvíľu.</td></tr>'
+    body_rows = "\n".join(rows) or '<tr><td colspan="5" class="empty">Zatiaľ nemám dáta o rabovaní z GGE Trackeru. Skús refresh o chvíľu.</td></tr>'
     last_sync = data["last_sync"].strftime("%d.%m. %H:%M") if hasattr(data["last_sync"], "strftime") else "zatiaľ bez syncu"
-    total_diff = total_this_week - total_last_week
     cards = [
         ("Členovia", fmt_number(len(data["players"]))),
-        ("Tento týždeň", fmt_number(total_this_week)),
-        ("Minulý týždeň", fmt_number(total_last_week)),
-        ("Rozdiel", fmt_signed(total_diff)),
+        ("Aktuálne rabovanie", fmt_number(total_this_week)),
     ]
     cards_html = "".join(f'<section class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></section>' for label, value in cards)
     body = f"""
     <section class="hero">
       <div class="hero-card">
         <h1>Rabovanie · ROYAL SOLDIERS</h1>
-        <p class="subtitle">Týždenné rabovanie členov podľa GGE Trackeru. Tento týždeň beriem z aktuálnej hodnoty <strong>loot_current</strong>, minulý týždeň z posledného dostupného snapshotu pred začiatkom aktuálneho týždňa. Posledný sync: <strong>{esc(last_sync)}</strong>.</p>
+        <p class="subtitle">Aktuálne rabovanie členov podľa GGE Trackeru. Beriem priamo hodnotu <strong>loot_current</strong>. Posledný sync: <strong>{esc(last_sync)}</strong>.</p>
       </div>
       <div class="filters hero-card">
         <h3>Zdroj</h3>
         <p class="subtitle" style="margin:0">Server: <strong>{esc(TRACKER_SERVER)}</strong><br>Aliancia: <strong>{esc(ALLIANCE_NAME)}</strong><br>Interval syncu: približne každých {fmt_number(TRACKER_SYNC_INTERVAL_SECONDS // 60)} min.</p>
       </div>
     </section>
-    <section class="cards" style="grid-template-columns:repeat(4,minmax(0,1fr))">{cards_html}</section>
-    <section class="panel"><div class="panel-head"><h2>Rabovanie podľa hráčov</h2><span class="pill">tento vs. minulý týždeň</span></div>
-      <table><thead><tr><th>#</th><th>Hráč</th><th class="num">Tento týždeň</th><th class="num">Minulý týždeň</th><th class="num">Rozdiel</th><th class="num">Level</th><th>Update</th></tr></thead><tbody>{body_rows}</tbody></table>
+    <section class="cards" style="grid-template-columns:repeat(2,minmax(0,1fr))">{cards_html}</section>
+    <section class="panel"><div class="panel-head"><h2>Rabovanie podľa hráčov</h2><span class="pill">aktuálny tracker stav</span></div>
+      <table><thead><tr><th>#</th>{sort_header("Hráč", base="/", params={"tab": "rabovanie"}, key="meno", active_sort=sort, direction=direction)}{sort_header("Rabovanie", base="/", params={"tab": "rabovanie"}, key="this_week", active_sort=sort, direction=direction, numeric=True)}{sort_header("Level", base="/", params={"tab": "rabovanie"}, key="level", active_sort=sort, direction=direction, numeric=True)}{sort_header("Update", base="/", params={"tab": "rabovanie"}, key="update", active_sort=sort, direction=direction)}</tr></thead><tbody>{body_rows}</tbody></table>
     </section>
     """
     return layout("Rabovanie · ROYAL SOLDIERS", body, active="loot")
+
+
+async def fetch_event_data(event_slug: str, sort: str = "score", direction: str = "desc") -> dict[str, Any]:
+    event_config = EVENT_TYPES[event_slug]
+    tracker_key = event_config["tracker_key"]
+    db = ensure_pool()
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH current_window AS (
+                SELECT started_at AS starts_at, ended_at AS ends_at
+                FROM tracker_event_occurrences
+                WHERE server = $1 AND event_key = $2
+                ORDER BY started_at DESC
+                LIMIT 1
+            ),
+            previous_window AS (
+                SELECT started_at AS starts_at, ended_at AS ends_at
+                FROM tracker_event_occurrences
+                WHERE server = $1
+                  AND event_key = $2
+                  AND started_at < (SELECT starts_at FROM current_window)
+                ORDER BY started_at DESC
+                LIMIT 1
+            ),
+            current_period AS (
+                SELECT server, event_key, player_id,
+                       MAX(event_points) AS current_score,
+                       MAX(recorded_at) AS current_at
+                FROM tracker_event_snapshots
+                WHERE server = $1
+                  AND event_key = $2
+                  AND recorded_at >= (SELECT starts_at FROM current_window)
+                  AND recorded_at < (SELECT ends_at FROM current_window)
+                GROUP BY server, event_key, player_id
+            ),
+            previous_period AS (
+                SELECT server, event_key, player_id,
+                       MAX(event_points) AS previous_score
+                FROM tracker_event_snapshots
+                WHERE server = $1
+                  AND event_key = $2
+                  AND recorded_at >= (SELECT starts_at FROM previous_window)
+                  AND recorded_at < (SELECT ends_at FROM previous_window)
+                GROUP BY server, event_key, player_id
+            )
+            SELECT
+                p.player_id,
+                p.player_name,
+                p.level,
+                p.legendary_level,
+                p.tracker_updated_at,
+                p.synced_at,
+                COALESCE(cp.current_score, 0) AS current_score,
+                COALESCE(pp.previous_score, 0) AS previous_score,
+                cp.current_at,
+                (SELECT starts_at FROM current_window) AS event_starts_at,
+                (SELECT ends_at FROM current_window) AS event_ends_at,
+                (SELECT starts_at FROM previous_window) AS previous_starts_at,
+                (SELECT ends_at FROM previous_window) AS previous_ends_at
+            FROM tracker_players p
+            LEFT JOIN current_period cp
+              ON cp.server = p.server AND cp.player_id = p.player_id
+            LEFT JOIN previous_period pp
+              ON pp.server = p.server AND pp.player_id = p.player_id
+            WHERE p.server = $1 AND p.alliance_name = $3
+            ORDER BY COALESCE(cp.current_score, 0) DESC, LOWER(p.player_name) ASC
+            """,
+            TRACKER_SERVER,
+            tracker_key,
+            ALLIANCE_NAME,
+        )
+        last_sync = await conn.fetchval(
+            """
+            SELECT MAX(recorded_at)
+            FROM tracker_event_snapshots
+            WHERE server = $1 AND event_key = $2
+            """,
+            TRACKER_SERVER,
+            tracker_key,
+        )
+    return {
+        "players": [dict(row) for row in rows],
+        "last_sync": last_sync,
+        "event_slug": event_slug,
+        "event": event_config,
+        "sort": sort,
+        "direction": direction,
+    }
+
+
+def render_event_tabs(active_slug: str) -> str:
+    return "".join(
+        f'<a class="tab {"active" if slug == active_slug else ""}" href="/?tab={esc(slug)}">{esc(config["emoji"])} {esc(config["nav"])}</a>'
+        for slug, config in EVENT_TYPES.items()
+    )
+
+
+def render_event_page(data: dict[str, Any]) -> str:
+    event_slug = data["event_slug"]
+    event = data["event"]
+    sort = data.get("sort", "score")
+    direction = data.get("direction", "desc")
+    rows = []
+    total_score = 0
+    total_previous = 0
+    active_players = 0
+    prepared_rows = []
+    current_start = data["players"][0].get("event_starts_at") if data["players"] else None
+    current_end = data["players"][0].get("event_ends_at") if data["players"] else None
+    previous_start = data["players"][0].get("previous_starts_at") if data["players"] else None
+    previous_end = data["players"][0].get("previous_ends_at") if data["players"] else None
+    for row in data["players"]:
+        score = int(row["current_score"] or 0)
+        previous = int(row["previous_score"] or 0)
+        diff = score - previous
+        total_score += score
+        total_previous += previous
+        if score > 0:
+            active_players += 1
+        prepared_rows.append({**row, "_score": score, "_previous": previous, "_diff": diff})
+
+    sort_field = {
+        "meno": "player_name",
+        "previous": "_previous",
+        "diff": "_diff",
+        "level": "legendary_level",
+        "update": "current_at",
+    }.get(sort, "_score")
+    prepared_rows.sort(
+        key=lambda row: (
+            str(row[sort_field]).lower()
+            if sort == "meno"
+            else row[sort_field] or row["synced_at"] or datetime.min.replace(tzinfo=timezone.utc)
+            if sort == "update"
+            else int(row[sort_field] or 0),
+            str(row["player_name"]).lower(),
+        ),
+        reverse=direction == "desc",
+    )
+
+    for index, row in enumerate(prepared_rows, start=1):
+        score = int(row["_score"])
+        previous = int(row["_previous"])
+        diff = int(row["_diff"])
+        diff_class = "good" if diff > 0 else "bad" if diff < 0 else ""
+        updated_at = row["current_at"] or row["tracker_updated_at"] or row["synced_at"]
+        updated_label = updated_at.strftime("%d.%m. %H:%M") if hasattr(updated_at, "strftime") else "—"
+        rows.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td>{esc(row['player_name'])}</td>"
+            f'<td class="num">{fmt_number(score)}</td>'
+            f'<td class="num">{fmt_number(previous)}</td>'
+            f'<td class="num {diff_class}">{fmt_signed(diff)}</td>'
+            f'<td class="num">{int(row["level"] or 0)}/{int(row["legendary_level"] or 0)}</td>'
+            f"<td>{esc(updated_label)}</td>"
+            "</tr>"
+        )
+    body_rows = "\n".join(rows) or '<tr><td colspan="7" class="empty">Zatiaľ nemám eventové dáta z GGE Trackeru. Skús refresh o chvíľu.</td></tr>'
+    last_sync = data["last_sync"].strftime("%d.%m. %H:%M") if hasattr(data["last_sync"], "strftime") else "zatiaľ bez syncu"
+    total_diff = total_score - total_previous
+    cards = [
+        ("Aktívni hráči", fmt_number(active_players)),
+        ("Body v udalosti", fmt_number(total_score)),
+        ("Predošlá udalosť", fmt_number(total_previous)),
+        ("Rozdiel", fmt_signed(total_diff)),
+    ]
+    cards_html = "".join(f'<section class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></section>' for label, value in cards)
+    params = {"tab": event_slug}
+    current_window_label = f"{fmt_dt(current_start)} – {fmt_dt(current_end)}"
+    previous_window_label = f"{fmt_dt(previous_start)} – {fmt_dt(previous_end)}" if previous_start and previous_end else "—"
+    body = f"""
+    <section class="hero">
+      <div class="hero-card">
+        <h1>{esc(event["emoji"])} {esc(event["title"])} · ROYAL SOLDIERS</h1>
+        <p class="subtitle">Výsledky hráčov z GGE Trackeru za presné trvanie udalosti, ktoré vracia tracker. Aktuálne zobrazené okno: <strong>{esc(current_window_label)}</strong>. Predošlé okno: <strong>{esc(previous_window_label)}</strong>. Posledný event sync: <strong>{esc(last_sync)}</strong>.</p>
+        <div class="periods">{render_event_tabs(event_slug)}</div>
+      </div>
+      <div class="filters hero-card">
+        <h3>Zdroj</h3>
+        <p class="subtitle" style="margin:0">Server: <strong>{esc(TRACKER_SERVER)}</strong><br>Aliancia: <strong>{esc(ALLIANCE_NAME)}</strong><br>Tracker kľúč: <strong>{esc(event["tracker_key"])}</strong></p>
+      </div>
+    </section>
+    <section class="cards" style="grid-template-columns:repeat(4,minmax(0,1fr))">{cards_html}</section>
+    <section class="panel"><div class="panel-head"><h2>{esc(event["title"])} podľa hráčov</h2><span class="pill">{esc(current_window_label)}</span></div>
+      <table><thead><tr><th>#</th>{sort_header("Hráč", base="/", params=params, key="meno", active_sort=sort, direction=direction)}{sort_header("Body", base="/", params=params, key="score", active_sort=sort, direction=direction, numeric=True)}{sort_header("Predošlé", base="/", params=params, key="previous", active_sort=sort, direction=direction, numeric=True)}{sort_header("Rozdiel", base="/", params=params, key="diff", active_sort=sort, direction=direction, numeric=True)}{sort_header("Level", base="/", params=params, key="level", active_sort=sort, direction=direction, numeric=True)}{sort_header("Update", base="/", params=params, key="update", active_sort=sort, direction=direction)}</tr></thead><tbody>{body_rows}</tbody></table>
+    </section>
+    """
+    return layout(f'{event["title"]} · ROYAL SOLDIERS', body, active=event_slug)
 
 
 def render_leaderboard(rows: list[dict[str, Any]], period: str, date_from: str | None, date_to: str | None) -> str:
@@ -1493,8 +1904,15 @@ def admin_redirect(message: str) -> RedirectResponse:
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     if request.query_params.get("tab") == "rabovanie":
-        data = await fetch_loot_data()
+        sort, direction = table_sort(request, {"meno", "this_week", "level", "update"}, "this_week")
+        data = await fetch_loot_data(sort, direction)
         return HTMLResponse(render_loot_page(data))
+
+    tab = request.query_params.get("tab")
+    if tab in EVENT_TYPES:
+        sort, direction = table_sort(request, {"meno", "score", "previous", "diff", "level", "update"}, "score")
+        data = await fetch_event_data(tab, sort, direction)
+        return HTMLResponse(render_event_page(data))
 
     if request.query_params.get("tab") == "moc" or request.query_params.get("view") == "moc":
         period = power_period(request)
@@ -1535,8 +1953,18 @@ async def power_player_page(player_id: int, request: Request):
 
 @app.get("/loot", response_class=HTMLResponse)
 async def loot_page(request: Request):
-    data = await fetch_loot_data()
+    sort, direction = table_sort(request, {"meno", "this_week", "level", "update"}, "this_week")
+    data = await fetch_loot_data(sort, direction)
     return HTMLResponse(render_loot_page(data))
+
+
+@app.get("/events/{event_slug}", response_class=HTMLResponse)
+async def event_page(event_slug: str, request: Request):
+    if event_slug not in EVENT_TYPES:
+        raise HTTPException(status_code=404, detail="Event sekcia neexistuje.")
+    sort, direction = table_sort(request, {"meno", "score", "previous", "diff", "level", "update"}, "score")
+    data = await fetch_event_data(event_slug, sort, direction)
+    return HTMLResponse(render_event_page(data))
 
 
 @app.get("/export.csv")
