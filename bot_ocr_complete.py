@@ -93,6 +93,28 @@ DISCORD_MEMBER_SYNC = os.getenv("DISCORD_MEMBER_SYNC", "0").strip().lower() in {
     "yes",
     "on",
 }
+DEFAULT_STATS_GUILD_ID = "1396931493862969384"  # ROYAL SOLDIERS
+
+
+def _parse_id_set(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for part in re.split(r"[,\s]+", raw.strip()):
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            print(f"[GGE] Ignoring invalid guild id in stats allowlist: {part!r}", file=sys.stderr)
+    return ids
+
+
+STATS_GUILD_IDS = _parse_id_set(
+    os.getenv("STATS_GUILD_IDS", os.getenv("ROYAL_GUILD_ID", DEFAULT_STATS_GUILD_ID))
+)
+
+
+def stats_enabled_for_guild(guild_id: int | None) -> bool:
+    return guild_id is not None and int(guild_id) in STATS_GUILD_IDS
 
 STATS_PERIODS = {
     "1d": ("za posledný 1 deň", 1),
@@ -2334,6 +2356,9 @@ def create_discord_client():
 
     async def sync_guild_members(guild: discord.Guild) -> None:
         """Store Discord members so the dashboard can assign reports to anyone."""
+        if not stats_enabled_for_guild(guild.id):
+            print(f"[GGE] Skipping Discord member sync for non-stats guild {guild.name} ({guild.id}).")
+            return
         if not DISCORD_MEMBER_SYNC:
             print(
                 "[GGE] Discord member sync is disabled. Set DISCORD_MEMBER_SYNC=1 "
@@ -2375,6 +2400,12 @@ def create_discord_client():
                 "Tento príkaz je dostupný iba na serveri.", ephemeral=True
             )
             return
+        if not stats_enabled_for_guild(interaction.guild_id):
+            await interaction.response.send_message(
+                "Štatistiky sú zapnuté iba na serveri ROYAL SOLDIERS. Tu fungujem iba ako ratio counter.",
+                ephemeral=True,
+            )
+            return
 
         await stats_ready.wait()
         period_key = obdobie.value if obdobie is not None else "all"
@@ -2405,6 +2436,12 @@ def create_discord_client():
         if interaction.guild_id is None:
             await interaction.response.send_message(
                 "Tento príkaz je dostupný iba na serveri.", ephemeral=True
+            )
+            return
+        if not stats_enabled_for_guild(interaction.guild_id):
+            await interaction.response.send_message(
+                "Štatistiky aliancie sú zapnuté iba na serveri ROYAL SOLDIERS.",
+                ephemeral=True,
             )
             return
 
@@ -2441,6 +2478,12 @@ def create_discord_client():
         if interaction.guild_id is None:
             await interaction.response.send_message(
                 "Tento príkaz je dostupný iba na serveri.", ephemeral=True
+            )
+            return
+        if not stats_enabled_for_guild(interaction.guild_id):
+            await interaction.response.send_message(
+                "Leaderboard je zapnutý iba na serveri ROYAL SOLDIERS.",
+                ephemeral=True,
             )
             return
 
@@ -2480,6 +2523,12 @@ def create_discord_client():
         if interaction.guild_id is None:
             await interaction.response.send_message(
                 "Tento príkaz je dostupný iba na serveri.", ephemeral=True
+            )
+            return
+        if not stats_enabled_for_guild(interaction.guild_id):
+            await interaction.response.send_message(
+                "Reset štatistík je dostupný iba na serveri ROYAL SOLDIERS.",
+                ephemeral=True,
             )
             return
         if not interaction.user.guild_permissions.administrator:
@@ -2531,6 +2580,8 @@ def create_discord_client():
     async def on_member_join(member):
         if not DISCORD_MEMBER_SYNC:
             return
+        if not stats_enabled_for_guild(member.guild.id):
+            return
         await stats_ready.wait()
         if not member.bot:
             await stats_store.upsert_discord_member(member.guild.id, member)
@@ -2539,6 +2590,8 @@ def create_discord_client():
     async def on_member_update(before, after):
         if not DISCORD_MEMBER_SYNC:
             return
+        if not stats_enabled_for_guild(after.guild.id):
+            return
         await stats_ready.wait()
         if not after.bot:
             await stats_store.upsert_discord_member(after.guild.id, after)
@@ -2546,6 +2599,8 @@ def create_discord_client():
     @client.event
     async def on_member_remove(member):
         if not DISCORD_MEMBER_SYNC:
+            return
+        if not stats_enabled_for_guild(member.guild.id):
             return
         await stats_ready.wait()
         if not member.bot:
@@ -2563,6 +2618,12 @@ def create_discord_client():
         content = (message.content or "").strip().lower()
         if content == ASSIGN_REPORT_COMMAND or content.startswith(f"{ASSIGN_REPORT_COMMAND} "):
             if message.guild is None:
+                return
+            if not stats_enabled_for_guild(guild_id):
+                await message.reply(
+                    "Assign reportov je dostupný iba na serveri ROYAL SOLDIERS.",
+                    mention_author=False,
+                )
                 return
             if not getattr(message.author.guild_permissions, "administrator", False):
                 await message.reply(
@@ -2628,6 +2689,12 @@ def create_discord_client():
         if content == BLACKLIST_REPORT_COMMAND:
             if message.guild is None:
                 return
+            if not stats_enabled_for_guild(guild_id):
+                await message.reply(
+                    "Blacklist reportov je dostupný iba na serveri ROYAL SOLDIERS.",
+                    mention_author=False,
+                )
+                return
             if not getattr(message.author.guild_permissions, "administrator", False):
                 await message.reply(
                     "Na tento príkaz potrebuješ oprávnenie Administrátor.",
@@ -2684,6 +2751,12 @@ def create_discord_client():
         if content == RELEASE_REPORT_COMMAND:
             if message.guild is None:
                 return
+            if not stats_enabled_for_guild(guild_id):
+                await message.reply(
+                    "Release reportov je dostupný iba na serveri ROYAL SOLDIERS.",
+                    mention_author=False,
+                )
+                return
             if not getattr(message.author.guild_permissions, "administrator", False):
                 await message.reply(
                     "Na tento príkaz potrebuješ oprávnenie Administrátor.",
@@ -2732,6 +2805,12 @@ def create_discord_client():
             return
 
         if content == STATS_COMMAND:
+            if not stats_enabled_for_guild(guild_id):
+                await message.reply(
+                    "Štatistiky sú zapnuté iba na serveri ROYAL SOLDIERS. Tu fungujem iba ako ratio counter.",
+                    mention_author=False,
+                )
+                return
             await stats_ready.wait()
             try:
                 stats = await stats_store.get_player_stats(guild_id, message.author.id)
@@ -2769,6 +2848,13 @@ def create_discord_client():
                     await message.add_reaction("🤏")
                 except discord.HTTPException as exc:
                     print(f"[GGE] Failed to add rift reaction: {exc}", file=sys.stderr)
+                continue
+
+            if not stats_enabled_for_guild(guild_id):
+                try:
+                    await message.reply(format_reply(result), mention_author=False)
+                except discord.HTTPException as exc:
+                    print(f"[GGE] Failed to send Discord reply: {exc}", file=sys.stderr)
                 continue
 
             try:
