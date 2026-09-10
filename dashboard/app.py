@@ -386,6 +386,16 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     {body}
     <footer>Public mód je read-only. Admin akcie sú chránené heslom a zapisujú priamo do rovnakej databázy ako Discord bot.</footer>
   </main>
+  <script>
+    document.addEventListener("submit", function (event) {{
+      const form = event.target;
+      if (!(form instanceof HTMLFormElement)) return;
+      const message = form.dataset.confirm;
+      if (message && !window.confirm(message)) {{
+        event.preventDefault();
+      }}
+    }});
+  </script>
 </body>
 </html>"""
 
@@ -551,8 +561,15 @@ def render_player_page(player_id: int, data: dict[str, Any], period: str, date_f
     return layout(f"{player_name} · GGE Report Dashboard", body)
 
 
-def action_form(action: str, label: str, fields: str, button_class: str = "btn") -> str:
-    return f'<form class="mini-form" method="post" action="/admin/{esc(action)}">{fields}<button class="{button_class}" type="submit">{esc(label)}</button></form>'
+def action_form(
+    action: str,
+    label: str,
+    fields: str,
+    button_class: str = "btn",
+    confirm: str | None = None,
+) -> str:
+    confirm_attr = f' data-confirm="{esc(confirm)}"' if confirm else ""
+    return f'<form class="mini-form" method="post" action="/admin/{esc(action)}"{confirm_attr}>{fields}<button class="{button_class}" type="submit">{esc(label)}</button></form>'
 
 
 def render_admin(data: dict[str, Any], message: str | None = None) -> str:
@@ -574,7 +591,9 @@ def render_admin(data: dict[str, Any], message: str | None = None) -> str:
             f"<td>{esc(row['player_name'])}<div class='report-meta'>{player_id}</div></td>"
             f"<td class='num'>{fmt_number(kills)}</td><td class='num'>{fmt_number(losses)}</td><td class='num'>{fmt_ratio(losses, kills)}</td>"
             f"<td class='num'>{msg_id}</td>"
-            f"<td>{action_form('release', 'Release', release_fields)}{action_form('blacklist', 'Blacklist', release_fields, 'btn danger')}{action_form('assign', 'Assign', assign_fields, 'btn primary')}</td>"
+            f"<td>{action_form('release', 'Release', release_fields, confirm=f'Naozaj uvoľniť report {msg_id}? Odpočíta sa hráčovi aj aliancii.')}"
+            f"{action_form('blacklist', 'Blacklist', release_fields, 'btn danger', f'Naozaj dať report {msg_id} na blacklist? Vymaže sa zo štatistík a už ho nikto nezapočíta.')}"
+            f"{action_form('assign', 'Assign', assign_fields, 'btn primary', f'Naozaj presunúť report {msg_id} na vybraného hráča?')}</td>"
             "</tr>"
         )
     report_table = "\n".join(report_rows) or '<tr><td colspan="7" class="empty">Žiadne reporty.</td></tr>'
@@ -582,14 +601,26 @@ def render_admin(data: dict[str, Any], message: str | None = None) -> str:
         f'<option value="{int(row["player_id"])}">{esc(row["player_name"])} · {fmt_number(row["total_kills"])} killov</option>'
         for row in data["players"]
     )
-    blacklist_rows = "\n".join(
-        "<tr>"
-        f"<td>{row['created_at'].strftime('%d.%m. %H:%M')}</td>"
-        f"<td class='num'>{fmt_number(row['enemy_kills'])}</td><td class='num'>{fmt_number(row['own_losses'])}</td>"
-        f"<td>{esc(row['blacklisted_by_name'] or 'admin')}</td><td class='num'>{int(row['source_message_id'] or 0)}</td>"
-        "</tr>"
-        for row in data["blacklist"]
-    ) or '<tr><td colspan="5" class="empty">Blacklist je prázdny.</td></tr>'
+    blacklist_rows = []
+    for row in data["blacklist"]:
+        guild_id = int(row["guild_id"])
+        own_losses = int(row["own_losses"] or 0)
+        enemy_kills = int(row["enemy_kills"] or 0)
+        source_message_id = int(row["source_message_id"] or 0)
+        remove_fields = (
+            f'<input type="hidden" name="guild_id" value="{guild_id}">'
+            f'<input type="hidden" name="own_losses" value="{own_losses}">'
+            f'<input type="hidden" name="enemy_kills" value="{enemy_kills}">'
+        )
+        blacklist_rows.append(
+            "<tr>"
+            f"<td>{row['created_at'].strftime('%d.%m. %H:%M')}</td>"
+            f"<td class='num'>{fmt_number(enemy_kills)}</td><td class='num'>{fmt_number(own_losses)}</td>"
+            f"<td>{esc(row['blacklisted_by_name'] or 'admin')}</td><td class='num'>{source_message_id}</td>"
+            f"<td>{action_form('blacklist-remove', 'Odstrániť', remove_fields, 'btn danger', f'Naozaj odstrániť blacklist pre {fmt_number(enemy_kills)} killov / {fmt_number(own_losses)} strát? Rovnaký report bude znovu možné započítať.')}</td>"
+            "</tr>"
+        )
+    blacklist_table = "\n".join(blacklist_rows) or '<tr><td colspan="6" class="empty">Blacklist je prázdny.</td></tr>'
     notice = f'<div class="notice">{esc(message)}</div>' if message else ""
     body = f"""
     <section class="hero-card" style="margin-bottom:18px"><h1>Admin panel</h1><p class="subtitle">Release, blacklist, assign a reset priamo z webu. Toto je chránené dashboard heslom.</p></section>
@@ -597,12 +628,12 @@ def render_admin(data: dict[str, Any], message: str | None = None) -> str:
     <section class="admin-grid">
       <div class="panel"><div class="panel-head"><h2>Rýchle akcie</h2></div><div class="panel-body">
         <h3>Reset hráča</h3>
-        <form class="mini-form" method="post" action="/admin/reset"><select name="player_id" required>{player_options}</select><select name="period"><option value="all">Celé obdobie</option><option value="30d">30 dní</option><option value="7d">7 dní</option><option value="24h">24h</option></select><button class="btn danger" type="submit">Resetnúť</button></form>
+        <form class="mini-form" method="post" action="/admin/reset" data-confirm="Naozaj resetnúť štatistiky vybraného hráča za zvolené obdobie? Táto akcia vymaže reporty z databázy."><select name="player_id" required>{player_options}</select><select name="period"><option value="all">Celé obdobie</option><option value="30d">30 dní</option><option value="7d">7 dní</option><option value="24h">24h</option></select><button class="btn danger" type="submit">Resetnúť</button></form>
         <h3 style="margin-top:22px">Manuálne podľa message ID</h3>
-        {action_form('release', 'Release report', '<input name="message_id" inputmode="numeric" placeholder="message id">')}
-        {action_form('blacklist', 'Blacklist report', '<input name="message_id" inputmode="numeric" placeholder="message id">', 'btn danger')}
+        {action_form('release', 'Release report', '<input name="message_id" inputmode="numeric" placeholder="message id">', confirm='Naozaj manuálne uvoľniť report podľa message ID?')}
+        {action_form('blacklist', 'Blacklist report', '<input name="message_id" inputmode="numeric" placeholder="message id">', 'btn danger', 'Naozaj manuálne pridať report na blacklist podľa message ID?')}
       </div></div>
-      <div class="panel"><div class="panel-head"><h2>Blacklist</h2></div><table><thead><tr><th>Čas</th><th class="num">Killy</th><th class="num">Straty</th><th>Admin</th><th class="num">Message</th></tr></thead><tbody>{blacklist_rows}</tbody></table></div>
+      <div class="panel"><div class="panel-head"><h2>Blacklist</h2></div><table><thead><tr><th>Čas</th><th class="num">Killy</th><th class="num">Straty</th><th>Admin</th><th class="num">Message</th><th>Akcia</th></tr></thead><tbody>{blacklist_table}</tbody></table></div>
     </section>
     <section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Report history</h2><a class="btn" href="/admin/reports.csv">CSV reporty</a></div><table><thead><tr><th>Čas</th><th>Hráč</th><th class="num">Killy</th><th class="num">Straty</th><th class="num">Ratio</th><th class="num">Message</th><th>Akcie</th></tr></thead><tbody>{report_table}</tbody></table></section>
     """
@@ -646,6 +677,20 @@ async def blacklist_by_message(message_id: int, admin_name: str) -> tuple[int, i
                     inserted += 1
             status = await conn.execute("DELETE FROM battle_reports WHERE message_id = $1", message_id)
             return int(status.rsplit(" ", 1)[-1]), inserted
+
+
+async def remove_blacklist_entry(guild_id: int, own_losses: int, enemy_kills: int) -> int:
+    db = ensure_pool()
+    status = await db.execute(
+        """
+        DELETE FROM battle_report_blacklist
+        WHERE guild_id = $1 AND own_losses = $2 AND enemy_kills = $3
+        """,
+        guild_id,
+        own_losses,
+        enemy_kills,
+    )
+    return int(status.rsplit(" ", 1)[-1])
 
 
 async def reset_player(player_id: int, period: str) -> int:
@@ -757,6 +802,17 @@ async def admin_blacklist(request: Request, user: str = Depends(require_auth)):
     form = parse_form_body(await request.body())
     deleted, inserted = await blacklist_by_message(int(form["message_id"]), user)
     return admin_redirect(f"Blacklist hotový. Vymazané reporty: {deleted}. Nové blacklist záznamy: {inserted}.")
+
+
+@app.post("/admin/blacklist-remove")
+async def admin_blacklist_remove(request: Request, user: str = Depends(require_auth)):
+    form = parse_form_body(await request.body())
+    deleted = await remove_blacklist_entry(
+        int(form["guild_id"]),
+        int(form["own_losses"]),
+        int(form["enemy_kills"]),
+    )
+    return admin_redirect(f"Blacklist záznam odstránený. Vymazané blacklist záznamy: {deleted}.")
 
 
 @app.post("/admin/reset")
