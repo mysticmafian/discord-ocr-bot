@@ -587,7 +587,7 @@ async def fetch_admin_data(*, page: int = 1, report_limit: int = ADMIN_REPORTS_P
 def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     nav = [
         ("dashboard", "/", "Dashboard"),
-        ("power", "/power", "Power"),
+        ("might", "/might", "Moc"),
         ("export", "/export.csv", "CSV export"),
         ("admin", "/admin", "Admin"),
     ]
@@ -836,7 +836,7 @@ def fmt_signed(value: int) -> str:
     return f"{sign}{fmt_number(value)}"
 
 
-def render_power_tabs(period: str, base: str = "/power") -> str:
+def render_power_tabs(period: str, base: str = "/might") -> str:
     return "".join(
         f'<a class="tab {"active" if key == period else ""}" href="{base}?period={key}">{esc(label)}</a>'
         for key, (label, _) in POWER_PERIODS.items()
@@ -884,7 +884,7 @@ def render_power_page(data: dict[str, Any]) -> str:
         rows.append(
             "<tr>"
             f"<td>{index}</td>"
-            f'<td><a class="player-link" href="/power/{int(row["player_id"])}?period={period}">{esc(row["player_name"])}</a></td>'
+            f'<td><a class="player-link" href="/might/{int(row["player_id"])}?period={period}">{esc(row["player_name"])}</a></td>'
             f'<td class="num">{fmt_number(current)}</td>'
             f'<td class="num {delta_class}">{fmt_signed(delta)}</td>'
             f'<td class="num">{int(row["level"] or 0)}/{int(row["legendary_level"] or 0)}</td>'
@@ -902,7 +902,7 @@ def render_power_page(data: dict[str, Any]) -> str:
     body = f"""
     <section class="hero">
       <div class="hero-card">
-        <h1>Power · ROYAL SOLDIERS</h1>
+        <h1>Moc · ROYAL SOLDIERS</h1>
         <p class="subtitle">Mená a moc členov z GGE Trackeru. Dáta sa pravidelne aktualizujú automaticky; posledný sync: <strong>{esc(last_sync)}</strong>.</p>
         <div class="periods">{render_power_tabs(period)}</div>
       </div>
@@ -916,7 +916,7 @@ def render_power_page(data: dict[str, Any]) -> str:
       <table><thead><tr><th>#</th><th>Hráč</th><th class="num">Power</th><th class="num">Zmena</th><th class="num">Level</th><th>Update</th></tr></thead><tbody>{body_rows}</tbody></table>
     </section>
     """
-    return layout("Power · ROYAL SOLDIERS", body, active="power")
+    return layout("Moc · ROYAL SOLDIERS", body, active="might")
 
 
 def render_power_player_page(player_id: int, data: dict[str, Any]) -> str:
@@ -941,17 +941,17 @@ def render_power_player_page(player_id: int, data: dict[str, Any]) -> str:
     body = f"""
     <section class="hero">
       <div class="hero-card">
-        <a class="tab" href="/power?period={period}">← Späť na Power</a>
+        <a class="tab" href="/might?period={period}">← Späť na Moc</a>
         <h1 style="margin-top:16px">{esc(player["player_name"])}</h1>
         <p class="subtitle">Vývoj moci hráča podľa dát z GGE Trackeru. Player ID: <code>{int(player_id)}</code></p>
-        <div class="periods">{render_power_tabs(period, f"/power/{int(player_id)}")}</div>
+        <div class="periods">{render_power_tabs(period, f"/might/{int(player_id)}")}</div>
       </div>
       <div class="panel"><div class="panel-head"><h2>Trend power</h2></div><div class="panel-body">{render_power_chart(history)}</div></div>
     </section>
     <section class="cards" style="grid-template-columns:repeat(3,minmax(0,1fr))">{cards_html}</section>
     <section class="panel"><div class="panel-head"><h2>Posledné body</h2></div><table><thead><tr><th>Čas</th><th class="num">Power</th></tr></thead><tbody>{history_rows}</tbody></table></section>
     """
-    return layout(f"{player['player_name']} · Power", body, active="power")
+    return layout(f"{player['player_name']} · Moc", body, active="might")
 
 
 def render_leaderboard(rows: list[dict[str, Any]], period: str, date_from: str | None, date_to: str | None) -> str:
@@ -1282,14 +1282,14 @@ async def player_detail(player_id: int, request: Request):
     return HTMLResponse(render_player_page(player_id, data, period, date_from, date_to))
 
 
-@app.get("/power", response_class=HTMLResponse)
+@app.get("/might", response_class=HTMLResponse)
 async def power_page(request: Request):
     period = power_period(request)
     data = await fetch_power_data(period)
     return HTMLResponse(render_power_page(data))
 
 
-@app.get("/power/{player_id}", response_class=HTMLResponse)
+@app.get("/might/{player_id}", response_class=HTMLResponse)
 async def power_player_page(player_id: int, request: Request):
     period = power_period(request)
     data = await fetch_power_player_data(player_id, period)
