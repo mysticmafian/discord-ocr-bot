@@ -9,7 +9,7 @@ import json
 import os
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -39,10 +39,10 @@ PERIODS: dict[str, str] = {
     "30d": "30 dní",
     "all": "Celé obdobie",
 }
-POWER_PERIODS: dict[str, tuple[str, str]] = {
-    "24h": ("24h", "24 hours"),
-    "7d": ("7 dní", "7 days"),
-    "30d": ("30 dní", "30 days"),
+POWER_PERIODS: dict[str, tuple[str, timedelta]] = {
+    "24h": ("24h", timedelta(hours=24)),
+    "7d": ("7 dní", timedelta(days=7)),
+    "30d": ("30 dní", timedelta(days=30)),
 }
 ADMIN_REPORTS_PER_PAGE = 10
 
