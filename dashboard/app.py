@@ -1397,6 +1397,77 @@ def render_loot_page(data: dict[str, Any]) -> str:
     return layout("Rabovanie · ROYAL SOLDIERS", body, active="loot")
 
 
+async def fetch_live_event_fallback(event_slug: str, players: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not players:
+        return None
+    event_config = EVENT_TYPES[event_slug]
+    tracker_key = event_config["tracker_key"]
+    sample_player_id = int(players[0]["player_id"])
+    try:
+        alliance = await tracker_json_async(f"/alliances/name/{quote(ALLIANCE_NAME)}")
+        alliance_id = to_int(alliance.get("alliance_id"))
+        if not alliance_id:
+            return None
+        stats = await tracker_json_async(f"/statistics/alliance/{alliance_id}")
+        occurrence_data = await tracker_json_async(
+            f"/statistics/player/{sample_player_id}/{tracker_key}/occurrences"
+        )
+    except (urlerror.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"[DASHBOARD] Live event fallback failed for {tracker_key}: {type(exc).__name__}: {exc}")
+        return None
+
+    parsed_occurrences: list[tuple[datetime, datetime]] = []
+    for occurrence in occurrence_data.get("occurrences") or []:
+        started_at = parse_tracker_time(occurrence.get("started_at"))
+        ended_at = parse_tracker_time(occurrence.get("ended_at"))
+        if started_at is not None and ended_at is not None:
+            parsed_occurrences.append((started_at, ended_at))
+    parsed_occurrences.sort(key=lambda item: item[0])
+    if not parsed_occurrences:
+        return None
+
+    current_start, current_end = parsed_occurrences[-1]
+    previous_start, previous_end = parsed_occurrences[-2] if len(parsed_occurrences) > 1 else (None, None)
+    current_scores: dict[int, tuple[int, datetime | None]] = {}
+    previous_scores: dict[int, int] = {}
+    for point in (stats.get("points") or {}).get(tracker_key) or []:
+        player_id = to_int(point.get("player_id"))
+        recorded_at = parse_tracker_time(point.get("date"))
+        score = to_int(point.get("point"), -1)
+        if not player_id or recorded_at is None or score < 0:
+            continue
+        if current_start <= recorded_at < current_end:
+            existing_score, _ = current_scores.get(player_id, (0, None))
+            if score >= existing_score:
+                current_scores[player_id] = (score, recorded_at)
+        if previous_start is not None and previous_end is not None and previous_start <= recorded_at < previous_end:
+            previous_scores[player_id] = max(previous_scores.get(player_id, 0), score)
+
+    live_players = []
+    for player in players:
+        player_id = int(player["player_id"])
+        score, current_at = current_scores.get(player_id, (0, None))
+        live_players.append(
+            {
+                **player,
+                "current_score": score,
+                "previous_score": previous_scores.get(player_id, 0),
+                "current_at": current_at,
+                "event_starts_at": current_start,
+                "event_ends_at": current_end,
+                "previous_starts_at": previous_start,
+                "previous_ends_at": previous_end,
+            }
+        )
+    return {
+        "players": live_players,
+        "last_sync": utc_now(),
+        "event_slug": event_slug,
+        "event": event_config,
+        "live_fallback": True,
+    }
+
+
 async def fetch_event_data(event_slug: str, sort: str = "score", direction: str = "desc") -> dict[str, Any]:
     event_config = EVENT_TYPES[event_slug]
     tracker_key = event_config["tracker_key"]
@@ -1476,8 +1547,15 @@ async def fetch_event_data(event_slug: str, sort: str = "score", direction: str 
             TRACKER_SERVER,
             tracker_key,
         )
+    players = [dict(row) for row in rows]
+    if (last_sync is None or not any(int(row.get("current_score") or 0) for row in players)) and players:
+        live_data = await fetch_live_event_fallback(event_slug, players)
+        if live_data is not None:
+            live_data["sort"] = sort
+            live_data["direction"] = direction
+            return live_data
     return {
-        "players": [dict(row) for row in rows],
+        "players": players,
         "last_sync": last_sync,
         "event_slug": event_slug,
         "event": event_config,
