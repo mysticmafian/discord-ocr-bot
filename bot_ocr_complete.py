@@ -87,6 +87,12 @@ STATS_COMMAND = os.getenv("STATS_COMMAND", "!stats").strip().lower()
 RELEASE_REPORT_COMMAND = os.getenv("RELEASE_REPORT_COMMAND", "!release-report").strip().lower()
 BLACKLIST_REPORT_COMMAND = os.getenv("BLACKLIST_REPORT_COMMAND", "!blacklist").strip().lower()
 ASSIGN_REPORT_COMMAND = os.getenv("ASSIGN_REPORT_COMMAND", "!assign").strip().lower()
+DISCORD_MEMBER_SYNC = os.getenv("DISCORD_MEMBER_SYNC", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 STATS_PERIODS = {
     "1d": ("za posledný 1 deň", 1),
@@ -2318,7 +2324,7 @@ def create_discord_client():
 
     intents = discord.Intents.default()
     intents.message_content = True
-    intents.members = True
+    intents.members = DISCORD_MEMBER_SYNC
 
     client = discord.Client(intents=intents)
     command_tree = discord.app_commands.CommandTree(client)
@@ -2328,6 +2334,12 @@ def create_discord_client():
 
     async def sync_guild_members(guild: discord.Guild) -> None:
         """Store Discord members so the dashboard can assign reports to anyone."""
+        if not DISCORD_MEMBER_SYNC:
+            print(
+                "[GGE] Discord member sync is disabled. Set DISCORD_MEMBER_SYNC=1 "
+                "after enabling Server Members Intent in the Discord Developer Portal."
+            )
+            return
         synced = 0
         try:
             async for member in guild.fetch_members(limit=None):
@@ -2500,8 +2512,13 @@ def create_discord_client():
         if not stats_ready.is_set():
             await stats_store.initialize()
             stats_ready.set()
-            for guild in client.guilds:
-                await sync_guild_members(guild)
+            if DISCORD_MEMBER_SYNC:
+                for guild in client.guilds:
+                    await sync_guild_members(guild)
+            else:
+                print(
+                    "[GGE] Skipping full Discord member sync because DISCORD_MEMBER_SYNC is not enabled."
+                )
         if not commands_synced:
             synced = await command_tree.sync()
             commands_synced = True
@@ -2512,18 +2529,24 @@ def create_discord_client():
 
     @client.event
     async def on_member_join(member):
+        if not DISCORD_MEMBER_SYNC:
+            return
         await stats_ready.wait()
         if not member.bot:
             await stats_store.upsert_discord_member(member.guild.id, member)
 
     @client.event
     async def on_member_update(before, after):
+        if not DISCORD_MEMBER_SYNC:
+            return
         await stats_ready.wait()
         if not after.bot:
             await stats_store.upsert_discord_member(after.guild.id, after)
 
     @client.event
     async def on_member_remove(member):
+        if not DISCORD_MEMBER_SYNC:
+            return
         await stats_ready.wait()
         if not member.bot:
             await stats_store.mark_discord_member_inactive(member.guild.id, member.id)
