@@ -1561,6 +1561,20 @@ class StatsStore:
                     """
                 )
                 await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS discord_members (
+                        guild_id BIGINT NOT NULL,
+                        user_id BIGINT NOT NULL,
+                        display_name TEXT NOT NULL,
+                        username TEXT,
+                        is_bot BOOLEAN NOT NULL DEFAULT FALSE,
+                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (guild_id, user_id)
+                    )
+                    """
+                )
+                await conn.execute(
                     "CREATE INDEX IF NOT EXISTS battle_reports_player_idx "
                     "ON battle_reports (guild_id, player_id)"
                 )
@@ -1604,7 +1618,94 @@ class StatsStore:
                 );
                 CREATE INDEX IF NOT EXISTS battle_reports_player_idx
                     ON battle_reports (guild_id, player_id);
+                CREATE TABLE IF NOT EXISTS discord_members (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    display_name TEXT NOT NULL,
+                    username TEXT,
+                    is_bot INTEGER NOT NULL DEFAULT 0,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, user_id)
+                );
                 """
+            )
+
+    async def upsert_discord_member(self, guild_id: int, member) -> None:
+        display_name = getattr(member, "display_name", None) or getattr(member, "name", str(member.id))
+        username = getattr(member, "name", None) or display_name
+        is_bot = bool(getattr(member, "bot", False))
+        if self.pool is not None:
+            await self.pool.execute(
+                """
+                INSERT INTO discord_members (
+                    guild_id, user_id, display_name, username, is_bot, is_active, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, TRUE, NOW())
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    username = EXCLUDED.username,
+                    is_bot = EXCLUDED.is_bot,
+                    is_active = TRUE,
+                    updated_at = NOW()
+                """,
+                guild_id,
+                int(member.id),
+                display_name,
+                username,
+                is_bot,
+            )
+            return
+        await asyncio.to_thread(
+            self._upsert_discord_member_sqlite,
+            guild_id,
+            int(member.id),
+            display_name,
+            username,
+            is_bot,
+        )
+
+    def _upsert_discord_member_sqlite(
+        self, guild_id: int, user_id: int, display_name: str, username: str, is_bot: bool
+    ) -> None:
+        with self._connect_sqlite() as conn:
+            conn.execute(
+                """
+                INSERT INTO discord_members (
+                    guild_id, user_id, display_name, username, is_bot, is_active, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    username = excluded.username,
+                    is_bot = excluded.is_bot,
+                    is_active = 1,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (guild_id, user_id, display_name, username, int(is_bot)),
+            )
+
+    async def mark_discord_member_inactive(self, guild_id: int, user_id: int) -> None:
+        if self.pool is not None:
+            await self.pool.execute(
+                """
+                UPDATE discord_members
+                SET is_active = FALSE, updated_at = NOW()
+                WHERE guild_id = $1 AND user_id = $2
+                """,
+                guild_id,
+                user_id,
+            )
+            return
+        await asyncio.to_thread(self._mark_discord_member_inactive_sqlite, guild_id, user_id)
+
+    def _mark_discord_member_inactive_sqlite(self, guild_id: int, user_id: int) -> None:
+        with self._connect_sqlite() as conn:
+            conn.execute(
+                """
+                UPDATE discord_members
+                SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
             )
 
     async def record_battle(
@@ -2217,12 +2318,32 @@ def create_discord_client():
 
     intents = discord.Intents.default()
     intents.message_content = True
+    intents.members = True
 
     client = discord.Client(intents=intents)
     command_tree = discord.app_commands.CommandTree(client)
     stats_store = StatsStore(DATABASE_URL, STATS_DB_PATH)
     stats_ready = asyncio.Event()
     commands_synced = False
+
+    async def sync_guild_members(guild: discord.Guild) -> None:
+        """Store Discord members so the dashboard can assign reports to anyone."""
+        synced = 0
+        try:
+            async for member in guild.fetch_members(limit=None):
+                if not member.bot:
+                    await stats_store.upsert_discord_member(guild.id, member)
+                    synced += 1
+        except Exception as exc:
+            print(
+                f"[GGE] Full member sync failed for {guild.name}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            for member in guild.members:
+                if not member.bot:
+                    await stats_store.upsert_discord_member(guild.id, member)
+                    synced += 1
+        print(f"[GGE] Synced {synced} Discord members for {guild.name}")
 
     period_choices = [
         discord.app_commands.Choice(name="1 deň", value="1d"),
@@ -2379,6 +2500,8 @@ def create_discord_client():
         if not stats_ready.is_set():
             await stats_store.initialize()
             stats_ready.set()
+            for guild in client.guilds:
+                await sync_guild_members(guild)
         if not commands_synced:
             synced = await command_tree.sync()
             commands_synced = True
@@ -2386,6 +2509,24 @@ def create_discord_client():
         print(f"[GGE] Logged in as {client.user} (ID: {client.user.id})")
         print(f"[GGE] Statistics storage: {stats_store.backend_name}")
         print("[GGE] Robust OCR ready. Waiting for Goodgame Empire report screenshots...")
+
+    @client.event
+    async def on_member_join(member):
+        await stats_ready.wait()
+        if not member.bot:
+            await stats_store.upsert_discord_member(member.guild.id, member)
+
+    @client.event
+    async def on_member_update(before, after):
+        await stats_ready.wait()
+        if not after.bot:
+            await stats_store.upsert_discord_member(after.guild.id, after)
+
+    @client.event
+    async def on_member_remove(member):
+        await stats_ready.wait()
+        if not member.bot:
+            await stats_store.mark_discord_member_inactive(member.guild.id, member.id)
 
     @client.event
     async def on_message(message):
