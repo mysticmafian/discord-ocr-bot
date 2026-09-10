@@ -587,7 +587,7 @@ async def fetch_admin_data(*, page: int = 1, report_limit: int = ADMIN_REPORTS_P
 def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     nav = [
         ("dashboard", "/", "Dashboard"),
-        ("might", "/might", "Moc"),
+        ("might", "/?view=moc", "Moc"),
         ("export", "/export.csv", "CSV export"),
         ("admin", "/admin", "Admin"),
     ]
@@ -836,9 +836,15 @@ def fmt_signed(value: int) -> str:
     return f"{sign}{fmt_number(value)}"
 
 
-def render_power_tabs(period: str, base: str = "/might") -> str:
+def render_power_tabs(period: str, player_id: int | None = None) -> str:
+    def href_for(key: str) -> str:
+        params = {"view": "moc", "period": key}
+        if player_id is not None:
+            params["power_player_id"] = str(player_id)
+        return f"/?{urlencode(params)}"
+
     return "".join(
-        f'<a class="tab {"active" if key == period else ""}" href="{base}?period={key}">{esc(label)}</a>'
+        f'<a class="tab {"active" if key == period else ""}" href="{href_for(key)}">{esc(label)}</a>'
         for key, (label, _) in POWER_PERIODS.items()
     )
 
@@ -884,7 +890,7 @@ def render_power_page(data: dict[str, Any]) -> str:
         rows.append(
             "<tr>"
             f"<td>{index}</td>"
-            f'<td><a class="player-link" href="/might/{int(row["player_id"])}?period={period}">{esc(row["player_name"])}</a></td>'
+            f'<td><a class="player-link" href="/?{urlencode({"view": "moc", "power_player_id": str(int(row["player_id"])), "period": period})}">{esc(row["player_name"])}</a></td>'
             f'<td class="num">{fmt_number(current)}</td>'
             f'<td class="num {delta_class}">{fmt_signed(delta)}</td>'
             f'<td class="num">{int(row["level"] or 0)}/{int(row["legendary_level"] or 0)}</td>'
@@ -941,10 +947,10 @@ def render_power_player_page(player_id: int, data: dict[str, Any]) -> str:
     body = f"""
     <section class="hero">
       <div class="hero-card">
-        <a class="tab" href="/might?period={period}">← Späť na Moc</a>
+        <a class="tab" href="/?view=moc&period={period}">← Späť na Moc</a>
         <h1 style="margin-top:16px">{esc(player["player_name"])}</h1>
         <p class="subtitle">Vývoj moci hráča podľa dát z GGE Trackeru. Player ID: <code>{int(player_id)}</code></p>
-        <div class="periods">{render_power_tabs(period, f"/might/{int(player_id)}")}</div>
+        <div class="periods">{render_power_tabs(period, int(player_id))}</div>
       </div>
       <div class="panel"><div class="panel-head"><h2>Trend power</h2></div><div class="panel-body">{render_power_chart(history)}</div></div>
     </section>
@@ -1270,6 +1276,15 @@ def admin_redirect(message: str) -> RedirectResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    if request.query_params.get("view") == "moc":
+        period = power_period(request)
+        power_player_id = request.query_params.get("power_player_id")
+        if power_player_id:
+            data = await fetch_power_player_data(int(power_player_id), period)
+            return HTMLResponse(render_power_player_page(int(power_player_id), data))
+        data = await fetch_power_data(period)
+        return HTMLResponse(render_power_page(data))
+
     period, date_from, date_to = get_filters(request)
     data = await fetch_dashboard_data(period=period, date_from=date_from, date_to=date_to)
     return HTMLResponse(render_dashboard(data, period, date_from, date_to))
