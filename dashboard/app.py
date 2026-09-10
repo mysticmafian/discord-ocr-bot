@@ -159,6 +159,26 @@ async def ensure_dashboard_tables() -> None:
             ON tracker_power_snapshots (server, player_id, recorded_at DESC)
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracker_loot_snapshots (
+                server TEXT NOT NULL,
+                player_id BIGINT NOT NULL,
+                player_name TEXT NOT NULL,
+                alliance_name TEXT NOT NULL,
+                loot_points BIGINT NOT NULL,
+                recorded_at TIMESTAMPTZ NOT NULL,
+                source TEXT NOT NULL DEFAULT 'tracker',
+                PRIMARY KEY (server, player_id, recorded_at)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS tracker_loot_snapshots_player_time_idx
+            ON tracker_loot_snapshots (server, player_id, recorded_at DESC)
+            """
+        )
 
 
 def tracker_json(path: str) -> Any:
@@ -201,7 +221,7 @@ def to_int(value: Any, default: int = 0) -> int:
 
 
 async def sync_tracker_power() -> dict[str, int]:
-    """Fetch ROYAL SOLDIERS from GGE Tracker and store current + historic might points."""
+    """Fetch ROYAL SOLDIERS from GGE Tracker and store current + historic power/loot points."""
     db = ensure_pool()
     alliance_path = f"/alliances/name/{quote(ALLIANCE_NAME)}"
     alliance = await tracker_json_async(alliance_path)
@@ -212,9 +232,12 @@ async def sync_tracker_power() -> dict[str, int]:
     detail = await tracker_json_async(f"/alliances/id/{alliance_id}")
     players = detail.get("players") or []
     history: list[dict[str, Any]] = []
+    loot_history: list[dict[str, Any]] = []
     try:
         stats = await tracker_json_async(f"/statistics/alliance/{alliance_id}")
-        history = (stats.get("points") or {}).get("player_might_history") or []
+        points = stats.get("points") or {}
+        history = points.get("player_might_history") or []
+        loot_history = points.get("player_loot_history") or []
     except (urlerror.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"[DASHBOARD] Tracker history sync failed: {type(exc).__name__}: {exc}")
 
@@ -275,6 +298,20 @@ async def sync_tracker_power() -> dict[str, int]:
                     to_int(player.get("might_current")),
                     tracker_updated_at or current_time,
                 )
+                await conn.execute(
+                    """
+                    INSERT INTO tracker_loot_snapshots (
+                        server, player_id, player_name, alliance_name, loot_points, recorded_at, source
+                    ) VALUES ($1, $2, $3, $4, $5, $6, 'current')
+                    ON CONFLICT (server, player_id, recorded_at) DO NOTHING
+                    """,
+                    TRACKER_SERVER,
+                    player_id,
+                    str(player.get("player_name") or player_id),
+                    detail.get("alliance_name") or ALLIANCE_NAME,
+                    to_int(player.get("loot_current")),
+                    tracker_updated_at or current_time,
+                )
 
             for point in history:
                 player_id = to_int(point.get("player_id"))
@@ -304,7 +341,36 @@ async def sync_tracker_power() -> dict[str, int]:
                     might_points,
                     recorded_at,
                 )
-    return {"players": len(players), "history": len(history)}
+
+            for point in loot_history:
+                player_id = to_int(point.get("player_id"))
+                recorded_at = parse_tracker_time(point.get("date"))
+                loot_points = to_int(point.get("point"), -1)
+                if not player_id or recorded_at is None or loot_points < 0:
+                    continue
+                await conn.execute(
+                    """
+                    INSERT INTO tracker_loot_snapshots (
+                        server, player_id, player_name, alliance_name, loot_points, recorded_at, source
+                    ) VALUES (
+                        $1, $2,
+                        COALESCE((SELECT player_name FROM tracker_players WHERE server = $1 AND player_id = $2), $3),
+                        $4, $5, $6, 'history'
+                    )
+                    ON CONFLICT (server, player_id, recorded_at) DO UPDATE SET
+                        loot_points = EXCLUDED.loot_points,
+                        player_name = EXCLUDED.player_name,
+                        alliance_name = EXCLUDED.alliance_name,
+                        source = EXCLUDED.source
+                    """,
+                    TRACKER_SERVER,
+                    player_id,
+                    str(player_id),
+                    detail.get("alliance_name") or ALLIANCE_NAME,
+                    loot_points,
+                    recorded_at,
+                )
+    return {"players": len(players), "history": len(history), "loot_history": len(loot_history)}
 
 
 async def tracker_sync_loop() -> None:
@@ -313,7 +379,8 @@ async def tracker_sync_loop() -> None:
             result = await sync_tracker_power()
             print(
                 f"[DASHBOARD] Synced GGE Tracker power: {result['players']} players, "
-                f"{result['history']} history points"
+                f"{result['history']} power history points, "
+                f"{result.get('loot_history', 0)} loot history points"
             )
         except asyncio.CancelledError:
             raise
@@ -588,6 +655,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     nav = [
         ("dashboard", "/", "Dashboard"),
         ("might", "/?tab=moc", "Moc"),
+        ("loot", "/?tab=rabovanie", "Rabovanie"),
         ("export", "/export.csv", "CSV export"),
         ("admin", "/admin", "Admin"),
     ]
@@ -744,7 +812,17 @@ def power_period(request: Request) -> str:
     return period if period in POWER_PERIODS else "24h"
 
 
-async def fetch_power_data(period: str) -> dict[str, Any]:
+def power_sort(request: Request) -> tuple[str, str]:
+    sort = request.query_params.get("sort", "moc")
+    direction = request.query_params.get("dir", "desc")
+    if sort not in {"moc", "zmena"}:
+        sort = "moc"
+    if direction not in {"asc", "desc"}:
+        direction = "desc"
+    return sort, direction
+
+
+async def fetch_power_data(period: str, sort: str = "moc", direction: str = "desc") -> dict[str, Any]:
     db = ensure_pool()
     _, interval = POWER_PERIODS[period]
     async with db.acquire() as conn:
@@ -796,7 +874,13 @@ async def fetch_power_data(period: str) -> dict[str, Any]:
             TRACKER_SERVER,
             ALLIANCE_NAME,
         )
-    return {"players": [dict(row) for row in rows], "last_sync": last_sync, "period": period}
+    return {
+        "players": [dict(row) for row in rows],
+        "last_sync": last_sync,
+        "period": period,
+        "sort": sort,
+        "direction": direction,
+    }
 
 
 async def fetch_power_player_data(player_id: int, period: str) -> dict[str, Any]:
@@ -836,9 +920,14 @@ def fmt_signed(value: int) -> str:
     return f"{sign}{fmt_number(value)}"
 
 
-def render_power_tabs(period: str, player_id: int | None = None) -> str:
+def render_power_tabs(
+    period: str,
+    player_id: int | None = None,
+    sort: str = "moc",
+    direction: str = "desc",
+) -> str:
     def href_for(key: str) -> str:
-        params = {"tab": "moc", "period": key}
+        params = {"tab": "moc", "period": key, "sort": sort, "dir": direction}
         if player_id is not None:
             params["power_player_id"] = str(player_id)
         return f"/?{urlencode(params)}"
@@ -847,6 +936,21 @@ def render_power_tabs(period: str, player_id: int | None = None) -> str:
         f'<a class="tab {"active" if key == period else ""}" href="{href_for(key)}">{esc(label)}</a>'
         for key, (label, _) in POWER_PERIODS.items()
     )
+
+
+def render_power_sort_controls(period: str, sort: str, direction: str) -> str:
+    options = [
+        ("moc", "desc", "Moc ↓"),
+        ("moc", "asc", "Moc ↑"),
+        ("zmena", "desc", "Zmena ↓"),
+        ("zmena", "asc", "Zmena ↑"),
+    ]
+    links = []
+    for sort_key, dir_key, label in options:
+        active = sort == sort_key and direction == dir_key
+        href = f"/?{urlencode({'tab': 'moc', 'period': period, 'sort': sort_key, 'dir': dir_key})}"
+        links.append(f'<a class="tab {"active" if active else ""}" href="{href}">{esc(label)}</a>')
+    return "".join(links)
 
 
 def render_power_chart(rows: list[dict[str, Any]]) -> str:
@@ -874,16 +978,30 @@ def render_power_chart(rows: list[dict[str, Any]]) -> str:
 
 def render_power_page(data: dict[str, Any]) -> str:
     period = data["period"]
+    sort = data.get("sort", "moc")
+    direction = data.get("direction", "desc")
     period_label_text = POWER_PERIODS[period][0]
     rows = []
     total_might = 0
     total_delta = 0
-    for index, row in enumerate(data["players"], start=1):
+    prepared_rows = []
+    for row in data["players"]:
         current = int(row["might_current"] or 0)
         baseline = int(row["baseline_might"] or current)
         delta = current - baseline
         total_might += current
         total_delta += delta
+        prepared_rows.append({**row, "_current": current, "_delta": delta})
+
+    sort_field = "_delta" if sort == "zmena" else "_current"
+    prepared_rows.sort(
+        key=lambda row: (int(row[sort_field]), str(row["player_name"]).lower()),
+        reverse=direction == "desc",
+    )
+
+    for index, row in enumerate(prepared_rows, start=1):
+        current = int(row["_current"])
+        delta = int(row["_delta"])
         delta_class = "good" if delta > 0 else "bad" if delta < 0 else ""
         updated_at = row["tracker_updated_at"] or row["synced_at"]
         updated_label = updated_at.strftime("%d.%m. %H:%M") if hasattr(updated_at, "strftime") else "—"
@@ -910,10 +1028,12 @@ def render_power_page(data: dict[str, Any]) -> str:
       <div class="hero-card">
         <h1>Moc · ROYAL SOLDIERS</h1>
         <p class="subtitle">Mená a moc členov z GGE Trackeru. Dáta sa pravidelne aktualizujú automaticky; posledný sync: <strong>{esc(last_sync)}</strong>.</p>
-        <div class="periods">{render_power_tabs(period)}</div>
+        <div class="periods">{render_power_tabs(period, sort=sort, direction=direction)}</div>
       </div>
       <div class="filters hero-card">
-        <h3>Zdroj</h3>
+        <h3>Zoradenie</h3>
+        <div class="periods" style="margin-top:0">{render_power_sort_controls(period, sort, direction)}</div>
+        <h3 style="margin-top:18px">Zdroj</h3>
         <p class="subtitle" style="margin:0">Server: <strong>{esc(TRACKER_SERVER)}</strong><br>Aliancia: <strong>{esc(ALLIANCE_NAME)}</strong><br>Interval syncu: približne každých {fmt_number(TRACKER_SYNC_INTERVAL_SECONDS // 60)} min.</p>
       </div>
     </section>
@@ -958,6 +1078,102 @@ def render_power_player_page(player_id: int, data: dict[str, Any]) -> str:
     <section class="panel"><div class="panel-head"><h2>Posledné body</h2></div><table><thead><tr><th>Čas</th><th class="num">Power</th></tr></thead><tbody>{history_rows}</tbody></table></section>
     """
     return layout(f"{player['player_name']} · Moc", body, active="might")
+
+
+async def fetch_loot_data() -> dict[str, Any]:
+    db = ensure_pool()
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                p.player_id,
+                p.player_name,
+                p.level,
+                p.legendary_level,
+                p.loot_current AS this_week_loot,
+                COALESCE(last_week.loot_points, 0) AS last_week_loot,
+                p.tracker_updated_at,
+                p.synced_at
+            FROM tracker_players p
+            LEFT JOIN LATERAL (
+                SELECT loot_points, recorded_at
+                FROM tracker_loot_snapshots s
+                WHERE s.server = p.server
+                  AND s.player_id = p.player_id
+                  AND s.recorded_at >= date_trunc('week', NOW()) - INTERVAL '7 days'
+                  AND s.recorded_at < date_trunc('week', NOW())
+                ORDER BY s.recorded_at DESC
+                LIMIT 1
+            ) last_week ON TRUE
+            WHERE p.server = $1 AND p.alliance_name = $2
+            ORDER BY p.loot_current DESC, LOWER(p.player_name) ASC
+            """,
+            TRACKER_SERVER,
+            ALLIANCE_NAME,
+        )
+        last_sync = await conn.fetchval(
+            """
+            SELECT MAX(synced_at)
+            FROM tracker_players
+            WHERE server = $1 AND alliance_name = $2
+            """,
+            TRACKER_SERVER,
+            ALLIANCE_NAME,
+        )
+    return {"players": [dict(row) for row in rows], "last_sync": last_sync}
+
+
+def render_loot_page(data: dict[str, Any]) -> str:
+    rows = []
+    total_this_week = 0
+    total_last_week = 0
+    for index, row in enumerate(data["players"], start=1):
+        this_week = int(row["this_week_loot"] or 0)
+        last_week = int(row["last_week_loot"] or 0)
+        diff = this_week - last_week
+        total_this_week += this_week
+        total_last_week += last_week
+        diff_class = "good" if diff > 0 else "bad" if diff < 0 else ""
+        updated_at = row["tracker_updated_at"] or row["synced_at"]
+        updated_label = updated_at.strftime("%d.%m. %H:%M") if hasattr(updated_at, "strftime") else "—"
+        rows.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td>{esc(row['player_name'])}</td>"
+            f'<td class="num">{fmt_number(this_week)}</td>'
+            f'<td class="num">{fmt_number(last_week)}</td>'
+            f'<td class="num {diff_class}">{fmt_signed(diff)}</td>'
+            f'<td class="num">{int(row["level"] or 0)}/{int(row["legendary_level"] or 0)}</td>'
+            f"<td>{esc(updated_label)}</td>"
+            "</tr>"
+        )
+    body_rows = "\n".join(rows) or '<tr><td colspan="7" class="empty">Zatiaľ nemám dáta o rabovaní z GGE Trackeru. Skús refresh o chvíľu.</td></tr>'
+    last_sync = data["last_sync"].strftime("%d.%m. %H:%M") if hasattr(data["last_sync"], "strftime") else "zatiaľ bez syncu"
+    total_diff = total_this_week - total_last_week
+    cards = [
+        ("Členovia", fmt_number(len(data["players"]))),
+        ("Tento týždeň", fmt_number(total_this_week)),
+        ("Minulý týždeň", fmt_number(total_last_week)),
+        ("Rozdiel", fmt_signed(total_diff)),
+    ]
+    cards_html = "".join(f'<section class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></section>' for label, value in cards)
+    body = f"""
+    <section class="hero">
+      <div class="hero-card">
+        <h1>Rabovanie · ROYAL SOLDIERS</h1>
+        <p class="subtitle">Týždenné rabovanie členov podľa GGE Trackeru. Tento týždeň beriem z aktuálnej hodnoty <strong>loot_current</strong>, minulý týždeň z posledného dostupného snapshotu pred začiatkom aktuálneho týždňa. Posledný sync: <strong>{esc(last_sync)}</strong>.</p>
+      </div>
+      <div class="filters hero-card">
+        <h3>Zdroj</h3>
+        <p class="subtitle" style="margin:0">Server: <strong>{esc(TRACKER_SERVER)}</strong><br>Aliancia: <strong>{esc(ALLIANCE_NAME)}</strong><br>Interval syncu: približne každých {fmt_number(TRACKER_SYNC_INTERVAL_SECONDS // 60)} min.</p>
+      </div>
+    </section>
+    <section class="cards" style="grid-template-columns:repeat(4,minmax(0,1fr))">{cards_html}</section>
+    <section class="panel"><div class="panel-head"><h2>Rabovanie podľa hráčov</h2><span class="pill">tento vs. minulý týždeň</span></div>
+      <table><thead><tr><th>#</th><th>Hráč</th><th class="num">Tento týždeň</th><th class="num">Minulý týždeň</th><th class="num">Rozdiel</th><th class="num">Level</th><th>Update</th></tr></thead><tbody>{body_rows}</tbody></table>
+    </section>
+    """
+    return layout("Rabovanie · ROYAL SOLDIERS", body, active="loot")
 
 
 def render_leaderboard(rows: list[dict[str, Any]], period: str, date_from: str | None, date_to: str | None) -> str:
@@ -1276,13 +1492,18 @@ def admin_redirect(message: str) -> RedirectResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    if request.query_params.get("tab") == "rabovanie":
+        data = await fetch_loot_data()
+        return HTMLResponse(render_loot_page(data))
+
     if request.query_params.get("tab") == "moc" or request.query_params.get("view") == "moc":
         period = power_period(request)
+        sort, direction = power_sort(request)
         power_player_id = request.query_params.get("power_player_id")
         if power_player_id:
             data = await fetch_power_player_data(int(power_player_id), period)
             return HTMLResponse(render_power_player_page(int(power_player_id), data))
-        data = await fetch_power_data(period)
+        data = await fetch_power_data(period, sort, direction)
         return HTMLResponse(render_power_page(data))
 
     period, date_from, date_to = get_filters(request)
@@ -1300,7 +1521,8 @@ async def player_detail(player_id: int, request: Request):
 @app.get("/might", response_class=HTMLResponse)
 async def power_page(request: Request):
     period = power_period(request)
-    data = await fetch_power_data(period)
+    sort, direction = power_sort(request)
+    data = await fetch_power_data(period, sort, direction)
     return HTMLResponse(render_power_page(data))
 
 
@@ -1309,6 +1531,12 @@ async def power_player_page(player_id: int, request: Request):
     period = power_period(request)
     data = await fetch_power_player_data(player_id, period)
     return HTMLResponse(render_power_player_page(player_id, data))
+
+
+@app.get("/loot", response_class=HTMLResponse)
+async def loot_page(request: Request):
+    data = await fetch_loot_data()
+    return HTMLResponse(render_loot_page(data))
 
 
 @app.get("/export.csv")
