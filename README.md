@@ -73,7 +73,20 @@ Voliteľné premenné:
 ## Web dashboard
 
 Dashboard je samostatná Railway service v priečinku `dashboard/`. Je read-only,
-čiže len číta štatistiky z rovnakej PostgreSQL databázy ako bot.
+pre verejnú časť a používa rovnakú PostgreSQL databázu ako bot.
+
+Dashboard obsahuje:
+
+- súhrn aliancie,
+- leaderboard s killmi, stratami, ratio a počtom reportov,
+- filter 24h / 7 dní / 30 dní / celé obdobie / vlastný dátum,
+- graf aktivity,
+- detail hráča,
+- CSV export leaderboardu,
+- admin panel na release, blacklist, assign a reset reportov.
+
+Verejný dashboard je bez hesla. Admin panel `/admin` je chránený cez
+`DASHBOARD_USERNAME` a `DASHBOARD_PASSWORD`.
 
 V Railway vytvor novú service z toho istého GitHub repozitára a nastav:
 
@@ -84,4 +97,4 @@ V Railway vytvor novú service z toho istého GitHub repozitára a nastav:
 - `DASHBOARD_PASSWORD` – tvoje vlastné heslo
 
 Po deployi otvoríš URL novej Railway service a prihlásiš sa týmto menom a
-heslom.
+heslom do admin časti.
