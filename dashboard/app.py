@@ -26,6 +26,7 @@ PERIODS: dict[str, str] = {
     "30d": "30 dní",
     "all": "Celé obdobie",
 }
+ADMIN_REPORTS_PER_PAGE = 10
 
 security = HTTPBasic()
 pool: asyncpg.Pool | None = None
@@ -269,8 +270,11 @@ async def fetch_player_data(
     return {"summary": dict(summary), "reports": [dict(row) for row in reports], "chart": [dict(row) for row in chart]}
 
 
-async def fetch_admin_data() -> dict[str, Any]:
+async def fetch_admin_data(*, page: int = 1, report_limit: int = ADMIN_REPORTS_PER_PAGE) -> dict[str, Any]:
     db = ensure_pool()
+    page = max(page, 1)
+    report_limit = max(1, report_limit)
+    offset = (page - 1) * report_limit
     async with db.acquire() as conn:
         reports = await conn.fetch(
             """
@@ -278,9 +282,12 @@ async def fetch_admin_data() -> dict[str, Any]:
                    own_losses, enemy_kills, created_at
             FROM battle_reports
             ORDER BY created_at DESC
-            LIMIT 100
-            """
+            LIMIT $1 OFFSET $2
+            """,
+            report_limit,
+            offset,
         )
+        report_count = await conn.fetchval("SELECT COUNT(*) FROM battle_reports")
         players = await conn.fetch(
             """
             SELECT player_id, MAX(player_name) AS player_name,
@@ -302,7 +309,14 @@ async def fetch_admin_data() -> dict[str, Any]:
             LIMIT 100
             """
         )
-    return {"reports": [dict(row) for row in reports], "players": [dict(row) for row in players], "blacklist": [dict(row) for row in blacklist]}
+    return {
+        "reports": [dict(row) for row in reports],
+        "report_count": int(report_count or 0),
+        "page": page,
+        "per_page": report_limit,
+        "players": [dict(row) for row in players],
+        "blacklist": [dict(row) for row in blacklist],
+    }
 
 
 def layout(title: str, body: str, *, active: str = "dashboard") -> str:
@@ -372,6 +386,10 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .recent-list {{ display:grid; gap:10px; }} .report-item {{ display:grid; grid-template-columns:1fr auto; gap:10px; border-top:1px solid var(--line); padding:12px 0; }} .report-item:first-child {{ border-top:0; }}
     .report-meta {{ color:var(--muted); font-size:13px; margin-top:3px; }} .mini-form input {{ width:150px; padding:8px 9px; border-radius:10px; font-size:13px; }}
     .notice {{ margin:0 0 16px; padding:12px 14px; border-radius:14px; background:rgba(125,216,125,.12); border:1px solid rgba(125,216,125,.25); color:#caffe0; }}
+    details.panel {{ padding:0; }} summary.panel-head {{ cursor:pointer; list-style:none; }} summary.panel-head::-webkit-details-marker {{ display:none; }}
+    .pagination {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; justify-content:flex-end; padding:0 18px 18px; }}
+    .page-link {{ min-width:38px; text-align:center; border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); text-decoration:none; border-radius:12px; padding:8px 11px; font-weight:900; }}
+    .page-link.active {{ background:linear-gradient(135deg,var(--gold),#e19b31); color:#1d1405; border-color:rgba(245,196,81,.65); }}
     footer {{ color:var(--muted); margin-top:22px; font-size:13px; }}
     @media (max-width:1050px) {{ .hero,.grid,.admin-grid {{ grid-template-columns:1fr; }} .cards {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
     @media (max-width:680px) {{ .shell {{ width:min(100% - 18px,1320px); padding-top:12px; }} .topbar {{ align-items:flex-start; flex-direction:column; }} .cards {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .panel {{ overflow-x:auto; }} th,td {{ padding:10px; }} .report-item {{ grid-template-columns:1fr; }} }}
@@ -572,7 +590,27 @@ def action_form(
     return f'<form class="mini-form" method="post" action="/admin/{esc(action)}"{confirm_attr}>{fields}<button class="{button_class}" type="submit">{esc(label)}</button></form>'
 
 
+def render_admin_pagination(current_page: int, total_reports: int, per_page: int) -> str:
+    total_pages = max(1, (total_reports + per_page - 1) // per_page)
+    if total_pages <= 1:
+        return ""
+    links = []
+    for page in range(1, total_pages + 1):
+        if total_pages > 9 and page not in {1, total_pages, current_page - 1, current_page, current_page + 1}:
+            if not links or links[-1] != '<span class="pill">…</span>':
+                links.append('<span class="pill">…</span>')
+            continue
+        active = " active" if page == current_page else ""
+        links.append(f'<a class="page-link{active}" href="/admin?page={page}">{page}</a>')
+    return f'<nav class="pagination" aria-label="Report history pages">{"".join(links)}</nav>'
+
+
 def render_admin(data: dict[str, Any], message: str | None = None) -> str:
+    player_options = "".join(
+        f'<option value="{int(row["player_id"])}">{esc(row["player_name"])} · {fmt_number(row["total_kills"])} killov</option>'
+        for row in data["players"]
+    )
+    assign_options = '<option value="">Vyber Discord meno…</option>' + player_options
     report_rows = []
     for row in data["reports"]:
         losses = int(row["own_losses"] or 0)
@@ -582,8 +620,7 @@ def render_admin(data: dict[str, Any], message: str | None = None) -> str:
         release_fields = f'<input type="hidden" name="message_id" value="{msg_id}">'
         assign_fields = (
             f'<input type="hidden" name="message_id" value="{msg_id}">'
-            '<input name="player_id" inputmode="numeric" placeholder="player id">'
-            '<input name="player_name" placeholder="meno hráča">'
+            f'<select name="target_player_id" required>{assign_options}</select>'
         )
         report_rows.append(
             "<tr>"
@@ -597,10 +634,6 @@ def render_admin(data: dict[str, Any], message: str | None = None) -> str:
             "</tr>"
         )
     report_table = "\n".join(report_rows) or '<tr><td colspan="7" class="empty">Žiadne reporty.</td></tr>'
-    player_options = "".join(
-        f'<option value="{int(row["player_id"])}">{esc(row["player_name"])} · {fmt_number(row["total_kills"])} killov</option>'
-        for row in data["players"]
-    )
     blacklist_rows = []
     for row in data["blacklist"]:
         guild_id = int(row["guild_id"])
@@ -622,6 +655,12 @@ def render_admin(data: dict[str, Any], message: str | None = None) -> str:
         )
     blacklist_table = "\n".join(blacklist_rows) or '<tr><td colspan="6" class="empty">Blacklist je prázdny.</td></tr>'
     notice = f'<div class="notice">{esc(message)}</div>' if message else ""
+    page = int(data.get("page", 1))
+    per_page = int(data.get("per_page", ADMIN_REPORTS_PER_PAGE))
+    report_count = int(data.get("report_count", len(data["reports"])))
+    first_report = ((page - 1) * per_page) + 1 if report_count else 0
+    last_report = min(page * per_page, report_count)
+    pagination = render_admin_pagination(page, report_count, per_page)
     body = f"""
     <section class="hero-card" style="margin-bottom:18px"><h1>Admin panel</h1><p class="subtitle">Release, blacklist, assign a reset priamo z webu. Toto je chránené dashboard heslom.</p></section>
     {notice}
@@ -633,9 +672,9 @@ def render_admin(data: dict[str, Any], message: str | None = None) -> str:
         {action_form('release', 'Release report', '<input name="message_id" inputmode="numeric" placeholder="message id">', confirm='Naozaj manuálne uvoľniť report podľa message ID?')}
         {action_form('blacklist', 'Blacklist report', '<input name="message_id" inputmode="numeric" placeholder="message id">', 'btn danger', 'Naozaj manuálne pridať report na blacklist podľa message ID?')}
       </div></div>
-      <div class="panel"><div class="panel-head"><h2>Blacklist</h2></div><table><thead><tr><th>Čas</th><th class="num">Killy</th><th class="num">Straty</th><th>Admin</th><th class="num">Message</th><th>Akcia</th></tr></thead><tbody>{blacklist_table}</tbody></table></div>
+      <details class="panel"><summary class="panel-head"><h2>Blacklist reportov</h2><span class="pill">Klikni pre rozbalenie</span></summary><table><thead><tr><th>Čas</th><th class="num">Killy</th><th class="num">Straty</th><th>Admin</th><th class="num">Message</th><th>Akcia</th></tr></thead><tbody>{blacklist_table}</tbody></table></details>
     </section>
-    <section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Report history</h2><a class="btn" href="/admin/reports.csv">CSV reporty</a></div><table><thead><tr><th>Čas</th><th>Hráč</th><th class="num">Killy</th><th class="num">Straty</th><th class="num">Ratio</th><th class="num">Message</th><th>Akcie</th></tr></thead><tbody>{report_table}</tbody></table></section>
+    <section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Report history</h2><div class="actions"><span class="pill">{first_report}–{last_report} z {report_count}</span><a class="btn" href="/admin/reports.csv">CSV reporty</a></div></div><table><thead><tr><th>Čas</th><th>Hráč</th><th class="num">Killy</th><th class="num">Straty</th><th class="num">Ratio</th><th class="num">Message</th><th>Akcie</th></tr></thead><tbody>{report_table}</tbody></table>{pagination}</section>
     """
     return layout("Admin · GGE Report Dashboard", body, active="admin")
 
@@ -646,10 +685,31 @@ async def release_by_message(message_id: int) -> int:
     return int(status.rsplit(" ", 1)[-1])
 
 
-async def assign_by_message(message_id: int, player_id: int, player_name: str) -> int:
+async def assign_by_message(message_id: int, target_player_id: int) -> int:
     db = ensure_pool()
-    status = await db.execute("UPDATE battle_reports SET player_id = $2, player_name = $3 WHERE message_id = $1", message_id, player_id, player_name)
-    return int(status.rsplit(" ", 1)[-1])
+    async with db.acquire() as conn:
+        player_name = await conn.fetchval(
+            """
+            SELECT player_name
+            FROM battle_reports
+            WHERE player_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            target_player_id,
+        )
+        if not player_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Selected Discord player was not found in stored reports.",
+            )
+        status_text = await conn.execute(
+            "UPDATE battle_reports SET player_id = $2, player_name = $3 WHERE message_id = $1",
+            message_id,
+            target_player_id,
+            player_name,
+        )
+    return int(status_text.rsplit(" ", 1)[-1])
 
 
 async def blacklist_by_message(message_id: int, admin_name: str) -> tuple[int, int]:
@@ -758,14 +818,14 @@ async def api_summary(request: Request):
 
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin(message: str | None = None, user: str = Depends(require_auth)):
-    data = await fetch_admin_data()
+async def admin(page: int = 1, message: str | None = None, user: str = Depends(require_auth)):
+    data = await fetch_admin_data(page=page)
     return HTMLResponse(render_admin(data, message))
 
 
 @app.get("/admin/reports.csv")
 async def admin_reports_csv(user: str = Depends(require_auth)):
-    data = await fetch_admin_data()
+    data = await fetch_admin_data(report_limit=100)
     rows = [
         [
             row["created_at"].isoformat(),
@@ -793,7 +853,7 @@ async def admin_release(request: Request, user: str = Depends(require_auth)):
 @app.post("/admin/assign")
 async def admin_assign(request: Request, user: str = Depends(require_auth)):
     form = parse_form_body(await request.body())
-    updated = await assign_by_message(int(form["message_id"]), int(form["player_id"]), form["player_name"])
+    updated = await assign_by_message(int(form["message_id"]), int(form["target_player_id"]))
     return admin_redirect(f"Assign hotový. Presunuté reporty: {updated}.")
 
 
