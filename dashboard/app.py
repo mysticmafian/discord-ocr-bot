@@ -952,6 +952,38 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     }}
     @media (max-width:1050px) {{ .app-frame {{ display:block; }} .sidebar {{ display:none; }} .mobile-nav {{ position:fixed; display:grid; grid-template-columns:repeat(5,1fr); left:12px; right:12px; bottom:12px; z-index:30; padding:7px; background:rgba(12,18,30,.96); border:1px solid rgba(148,163,184,.22); border-radius:18px; box-shadow:0 18px 50px rgba(0,0,0,.45); backdrop-filter:blur(18px); }} .mobile-nav-item {{ display:grid; justify-items:center; gap:3px; padding:8px 4px; border-radius:12px; color:var(--muted); text-decoration:none; font-size:10px; font-weight:900; }} .mobile-nav-item span {{ color:var(--cyan); font-size:17px; line-height:1; }} .mobile-nav-item.active {{ color:var(--text); background:rgba(110,215,232,.13); }} .workspace {{ padding-bottom:86px; }} .nav-menu {{ position:absolute; left:0; top:calc(100% + 6px); margin:0; padding:7px; min-width:190px; background:rgba(20,24,35,.98); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); z-index:20; }} .hero,.grid,.admin-grid {{ grid-template-columns:1fr; }} .cards {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
     @media (max-width:680px) {{ .shell {{ width:min(100% - 18px,1320px); padding-top:12px; }} .topbar {{ align-items:flex-start; flex-direction:column; }} .cards {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .panel {{ overflow-x:auto; }} th,td {{ padding:10px; }} .report-item {{ grid-template-columns:1fr; }} }}
+    /* Professional operations UI */
+    :root {{ color-scheme:light; --bg:#eef1f5; --panel:#ffffff; --panel2:#ffffff; --line:#d9e0e8; --text:#172235; --muted:#68778c; --gold:#b77b17; --cyan:#087f91; --green:#16764b; --red:#b33d4d; --shadow:0 8px 24px rgba(22,34,53,.07); }}
+    body {{ background:var(--bg); color:var(--text); }}
+    .shell {{ width:min(1540px,calc(100% - 48px)); padding:24px 0 42px; }}
+    .app-frame {{ grid-template-columns:250px minmax(0,1fr); gap:30px; }}
+    .sidebar {{ top:24px; padding:22px 14px; min-height:calc(100vh - 48px); background:#15243a; border:0; border-radius:14px; box-shadow:0 12px 30px rgba(22,34,53,.14); }}
+    .crest {{ width:40px; height:40px; border-radius:10px; background:#e6b84f; color:#15243a; box-shadow:none; }}
+    .brand strong {{ color:#fff; font-size:16px; letter-spacing:.06em; }} .brand span span {{ color:#a9b8cb; }}
+    .nav-section-label {{ color:#8093aa; padding:0 12px; }}
+    .nav-link {{ color:#b9c6d6; border-radius:8px; padding:11px 12px; }}
+    .nav-link:hover {{ color:#fff; background:rgba(255,255,255,.07); border-color:transparent; transform:none; }}
+    .nav-link.active {{ color:#fff; background:#243b59; border-color:transparent; box-shadow:inset 3px 0 0 #e6b84f; }}
+    .nav-icon {{ color:#e6b84f; }}
+    .nav-sub-link {{ color:#9eb0c5; border-radius:7px; }} .nav-sub-link:hover,.nav-sub-link.active {{ color:#fff; background:#243b59; }} .nav-sub-link.active {{ color:#e6b84f; }}
+    .topbar {{ margin-bottom:26px; padding:0 0 18px; border-bottom:1px solid var(--line); backdrop-filter:none; }}
+    .eyebrow {{ color:var(--cyan); }} .topbar-context strong {{ font-size:22px; }}
+    .pill {{ border-radius:6px; padding:5px 8px; background:#f3f6f9; border-color:var(--line); color:var(--muted); }}
+    .hero {{ gap:20px; margin:0 0 20px; }}
+    .hero-card,.panel,.card {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); }}
+    .hero-card {{ padding:26px; }} h1 {{ color:var(--text); font-size:clamp(28px,3.5vw,42px); letter-spacing:-.035em; }}
+    h2 {{ color:var(--text); font-size:18px; }} h3 {{ color:var(--cyan); }} .subtitle {{ color:var(--muted); }}
+    .filters {{ background:#f8fafc; box-shadow:none; }}
+    .periods {{ gap:0; border:1px solid var(--line); border-radius:8px; width:max-content; overflow:hidden; }}
+    .tab {{ border:0; border-right:1px solid var(--line); border-radius:0; background:#fff; color:var(--muted); }} .tab:last-child {{ border-right:0; }} .tab.active {{ color:#fff; background:#087f91; box-shadow:none; }}
+    .cards {{ gap:14px; }} .card {{ min-height:100px; border-radius:10px; }} .card::after {{ background:var(--cyan); height:3px; }} .card span {{ color:var(--muted); }} .card strong {{ color:var(--text); }}
+    .panel-head {{ border-bottom:1px solid transparent; }} table {{ background:#fff; }} th {{ color:#74849a; background:#f7f9fb; border-top:1px solid var(--line); }} th,td {{ border-color:var(--line); }} tbody tr:hover td {{ background:#f1f8fa; }}
+    .rank {{ border-radius:7px; background:#eef2f6; }} .rank.top {{ background:#e6b84f; color:#15243a; }} .player-link {{ color:#1c4f67; }}
+    input,select {{ background:#fff; color:var(--text); border-color:#cbd5e1; border-radius:8px; }}
+    .btn {{ border:1px solid #cbd5e1; border-radius:8px; background:#fff; color:#314258; }} .btn:hover {{ background:#f1f8fa; border-color:#87bfc8; }} .btn.primary {{ color:#fff; background:#087f91; border-color:#087f91; }}
+    .notice {{ background:#eaf7f0; border-color:#b8e0c8; color:#17613e; }}
+    footer {{ color:#8795a7; }}
+    @media (max-width:1050px) {{ .shell {{ width:min(100% - 24px,1320px); }} .mobile-nav {{ background:#15243a; border:0; box-shadow:0 12px 30px rgba(22,34,53,.22); }} .mobile-nav-item {{ color:#aebed0; }} .mobile-nav-item span {{ color:#e6b84f; }} .mobile-nav-item.active {{ color:#fff; background:#243b59; }} }}
   </style>
 </head>
 <body>
