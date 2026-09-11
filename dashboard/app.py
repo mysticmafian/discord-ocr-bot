@@ -1583,7 +1583,12 @@ async def fetch_event_data(event_slug: str, sort: str = "score", direction: str 
         )
     players = [dict(row) for row in rows]
     if (last_sync is None or not any(int(row.get("current_score") or 0) for row in players)) and players:
-        live_data = await fetch_live_event_fallback(event_slug, players)
+        # A slow tracker must never hold the page open long enough for Railway
+        # to return a gateway error. The cached database data is still useful.
+        try:
+            live_data = await asyncio.wait_for(fetch_live_event_fallback(event_slug, players), timeout=10)
+        except asyncio.TimeoutError:
+            live_data = None
         if live_data is not None:
             live_data["sort"] = sort
             live_data["direction"] = direction
