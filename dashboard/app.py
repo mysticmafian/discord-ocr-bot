@@ -834,15 +834,15 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
         f'<a class="nav-link {"active" if key == active else ""}" href="{href}"><span class="nav-icon">{icon}</span>{label}</a>'
         for key, href, label, icon in nav[:3]
     )
-    event_active = active == "dashboard" or active in EVENT_TYPES
+    event_active = active in EVENT_TYPES
     event_links = "".join(
         f'<a class="nav-sub-link {"active" if slug == active else ""}" href="/?tab={esc(slug)}"><span>{esc(config["emoji"])}</span>{esc(config["nav"])}</a>'
         for slug, config in EVENT_TYPES.items()
     )
     report_link = f'<a class="nav-sub-link {"active" if active == "dashboard" else ""}" href="/"><span>▤</span>Prehľad reportov</a>'
-    events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}"><span class="nav-icon">⚔</span>Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{event_links}{report_link}</div></details>'
+    events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}"><span class="nav-icon">⚔</span>Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{event_links}</div></details>'
     admin_link = f'<details class="nav-group" {"open" if active == "admin" else ""}><summary class="nav-link {"active" if active == "admin" else ""}"><span class="nav-icon">⚙</span>Admin <span class="nav-chevron">⌄</span></summary><div class="nav-menu"><a class="nav-sub-link {"active" if active == "admin" else ""}" href="/admin"><span>◉</span>Nastavenie prehľadu reportov</a></div></details>'
-    nav_html = '<div class="nav-section-label">Štatistiky</div>' + nav_html + '<div class="nav-section-label events-label">Udalosti</div>' + events_nav + '<div class="nav-section-label admin-label">Správa</div>' + admin_link
+    nav_html = '<div class="nav-section-label">Štatistiky</div>' + nav_html + '<div class="nav-section-label events-label">Eventy</div>' + events_nav + '<div class="nav-section-label reports-label">Reporty</div>' + report_link + '<div class="nav-section-label admin-label">Správa</div>' + admin_link
     access_label = "admin" if active == "admin" else "read-only"
     mobile_nav = f'''<nav class="mobile-nav" aria-label="Mobilná navigácia">
       <a class="mobile-nav-item {"active" if active == "dashboard" else ""}" href="/"><span>▤</span>Reporty</a>
@@ -893,7 +893,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .nav-link.active,.btn.primary,.tab.active {{ background:linear-gradient(135deg,rgba(110,215,232,.18),rgba(243,201,105,.16)); color:var(--text); border-color:rgba(110,215,232,.35); box-shadow:inset 3px 0 0 var(--cyan); }}
     .nav-icon {{ display:inline-grid; width:22px; place-items:center; margin-right:8px; color:var(--cyan); font-size:16px; }}
     .nav-section-label {{ padding:0 13px; color:#5f718b; font-size:10px; font-weight:900; letter-spacing:.16em; text-transform:uppercase; }}
-    .events-label {{ margin-top:5px; }} .admin-label {{ margin-top:auto; }}
+    .events-label {{ margin-top:5px; }} .reports-label {{ margin-top:11px; }} .admin-label {{ margin-top:auto; }}
     .nav-group {{ position:relative; width:100%; }}
     .nav-group summary {{ cursor:pointer; list-style:none; user-select:none; }}
     .nav-group summary::-webkit-details-marker {{ display:none; }}
