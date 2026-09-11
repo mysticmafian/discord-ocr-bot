@@ -958,7 +958,6 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
       <footer>Public mód je read-only. Admin akcie sú chránené heslom a zapisujú priamo do rovnakej databázy ako Discord bot.</footer>
     </section>
   </div></main>
-  </main>
   <script>
     document.addEventListener("submit", function (event) {{
       const form = event.target;
