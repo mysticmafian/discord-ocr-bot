@@ -827,26 +827,25 @@ async def fetch_admin_data(*, page: int = 1, report_limit: int = ADMIN_REPORTS_P
 
 def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     nav = [
-        ("dashboard", "/", "Dashboard", "⌂"),
         ("might", "/?tab=moc", "Moc", "◈"),
         ("loot", "/?tab=rabovanie", "Rabovanie", "▥"),
-        ("admin", "/admin", "Admin", "⚙"),
     ]
     nav_html = "".join(
         f'<a class="nav-link {"active" if key == active else ""}" href="{href}"><span class="nav-icon">{icon}</span>{label}</a>'
         for key, href, label, icon in nav[:3]
     )
-    event_active = active in EVENT_TYPES
+    event_active = active == "dashboard" or active in EVENT_TYPES
     event_links = "".join(
         f'<a class="nav-sub-link {"active" if slug == active else ""}" href="/?tab={esc(slug)}"><span>{esc(config["emoji"])}</span>{esc(config["nav"])}</a>'
         for slug, config in EVENT_TYPES.items()
     )
-    events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}"><span class="nav-icon">⚔</span>Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{event_links}</div></details>'
-    admin_link = f'<a class="nav-link {"active" if active == "admin" else ""}" href="/admin"><span class="nav-icon">⚙</span>Admin</a>'
-    nav_html = '<div class="nav-section-label">Prehľad</div>' + nav_html + '<div class="nav-section-label events-label">Udalosti</div>' + events_nav + '<div class="nav-section-label admin-label">Správa</div>' + admin_link
+    report_link = f'<a class="nav-sub-link {"active" if active == "dashboard" else ""}" href="/"><span>▤</span>Prehľad reportov</a>'
+    events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}"><span class="nav-icon">⚔</span>Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{report_link}{event_links}</div></details>'
+    admin_link = f'<details class="nav-group" {"open" if active == "admin" else ""}><summary class="nav-link {"active" if active == "admin" else ""}"><span class="nav-icon">⚙</span>Admin <span class="nav-chevron">⌄</span></summary><div class="nav-menu"><a class="nav-sub-link {"active" if active == "admin" else ""}" href="/admin"><span>◉</span>Nastavenie prehľadu reportov</a></div></details>'
+    nav_html = '<div class="nav-section-label">Štatistiky</div>' + nav_html + '<div class="nav-section-label events-label">Udalosti</div>' + events_nav + '<div class="nav-section-label admin-label">Správa</div>' + admin_link
     access_label = "admin" if active == "admin" else "read-only"
     mobile_nav = f'''<nav class="mobile-nav" aria-label="Mobilná navigácia">
-      <a class="mobile-nav-item {"active" if active == "dashboard" else ""}" href="/"><span>⌂</span>Prehľad</a>
+      <a class="mobile-nav-item {"active" if active == "dashboard" else ""}" href="/"><span>▤</span>Reporty</a>
       <a class="mobile-nav-item {"active" if active == "might" else ""}" href="/?tab=moc"><span>◈</span>Moc</a>
       <a class="mobile-nav-item {"active" if event_active else ""}" href="/?tab=nomadi"><span>⚔</span>Eventy</a>
       <a class="mobile-nav-item {"active" if active == "loot" else ""}" href="/?tab=rabovanie"><span>▥</span>Loot</a>
@@ -1831,8 +1830,8 @@ def render_dashboard(data: dict[str, Any], period: str, date_from: str | None, d
     body = f"""
     <section class="hero">
       <div class="hero-card">
-        <h1>ROYAL SOLDIERS</h1>
-        <p class="subtitle">Prehľad killov, strát, ratio, reportov a aktivity hráčov za <strong>{esc(label)}</strong>.</p>
+        <h1>Prehľad reportov</h1>
+        <p class="subtitle">Killy, straty, ratio a aktivita hráčov aliancie za <strong>{esc(label)}</strong>.</p>
         <div class="periods">{render_period_tabs(period, date_from, date_to)}</div>
       </div>
       {render_filter_form(period, date_from, date_to)}
@@ -1847,7 +1846,7 @@ def render_dashboard(data: dict[str, Any], period: str, date_from: str | None, d
     </section>
     <section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Posledné reporty</h2><span class="pill">read-only</span></div><div class="panel-body">{render_recent(data["recent"])}</div></section>
     """
-    return layout("GGE Report Dashboard", body)
+    return layout("Prehľad reportov · ROYAL SOLDIERS", body)
 
 
 def render_player_page(player_id: int, data: dict[str, Any], period: str, date_from: str | None, date_to: str | None) -> str:

@@ -82,7 +82,6 @@ Dashboard obsahuje:
 - filter 24h / 7 dní / 30 dní / celé obdobie / vlastný dátum,
 - graf aktivity,
 - detail hráča,
-- CSV export leaderboardu,
 - admin panel na release, blacklist, assign a reset reportov.
 
 Verejný dashboard je bez hesla. Admin panel `/admin` je chránený cez
