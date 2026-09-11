@@ -827,22 +827,23 @@ async def fetch_admin_data(*, page: int = 1, report_limit: int = ADMIN_REPORTS_P
 
 def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     nav = [
-        ("dashboard", "/", "Dashboard"),
-        ("might", "/?tab=moc", "Moc"),
-        ("loot", "/?tab=rabovanie", "Rabovanie"),
-        ("admin", "/admin", "Admin"),
+        ("dashboard", "/", "Dashboard", "⌂"),
+        ("might", "/?tab=moc", "Moc", "◈"),
+        ("loot", "/?tab=rabovanie", "Rabovanie", "▥"),
+        ("admin", "/admin", "Admin", "⚙"),
     ]
     nav_html = "".join(
-        f'<a class="nav-link {"active" if key == active else ""}" href="{href}">{label}</a>'
-        for key, href, label in nav
+        f'<a class="nav-link {"active" if key == active else ""}" href="{href}"><span class="nav-icon">{icon}</span>{label}</a>'
+        for key, href, label, icon in nav[:3]
     )
     event_active = active in EVENT_TYPES
     event_links = "".join(
         f'<a class="nav-sub-link {"active" if slug == active else ""}" href="/?tab={esc(slug)}"><span>{esc(config["emoji"])}</span>{esc(config["nav"])}</a>'
         for slug, config in EVENT_TYPES.items()
     )
-    events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}">⚔️ Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{event_links}</div></details>'
-    nav_html = nav_html.replace(f'<a class="nav-link {"active" if active == "admin" else ""}" href="/admin">Admin</a>', events_nav + f'<a class="nav-link {"active" if active == "admin" else ""}" href="/admin">Admin</a>')
+    events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}"><span class="nav-icon">⚔</span>Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{event_links}</div></details>'
+    admin_link = f'<a class="nav-link {"active" if active == "admin" else ""}" href="/admin"><span class="nav-icon">⚙</span>Admin</a>'
+    nav_html = '<div class="nav-section-label">Prehľad</div>' + nav_html + '<div class="nav-section-label events-label">Udalosti</div>' + events_nav + '<div class="nav-section-label admin-label">Správa</div>' + admin_link
     access_label = "admin" if active == "admin" else "read-only"
     return f"""<!doctype html>
 <html lang="sk">
@@ -853,22 +854,22 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
   <style>
     :root {{
       color-scheme: dark;
-      --bg: #080a0f; --panel: rgba(20,24,35,.88); --panel2: rgba(30,36,52,.94);
-      --line: rgba(255,255,255,.10); --text: #f7f3e8; --muted: #9ca3af;
-      --gold: #f5c451; --green: #7dd87d; --red: #ff7575; --shadow: 0 18px 50px rgba(0,0,0,.38);
+      --bg: #070a11; --panel: rgba(15,21,34,.92); --panel2: rgba(21,30,48,.96);
+      --line: rgba(148,163,184,.16); --text: #f4f7fb; --muted: #91a0b5;
+      --gold: #f3c969; --cyan: #6ed7e8; --green: #7ee2a8; --red: #ff7f8f; --shadow: 0 24px 70px rgba(0,0,0,.34);
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin:0; min-height:100vh; font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: radial-gradient(circle at top left, rgba(245,196,81,.18), transparent 34rem),
-                  radial-gradient(circle at 70% 10%, rgba(130,182,255,.11), transparent 28rem),
-                  linear-gradient(180deg, #0b0e15, #080a0f 45%, #06070b);
+      background: radial-gradient(circle at 0% 0%, rgba(110,215,232,.10), transparent 32rem),
+                  radial-gradient(circle at 90% 4%, rgba(243,201,105,.10), transparent 28rem),
+                  linear-gradient(180deg, #0a0f1a, #070a11 55%, #05070c);
       color:var(--text);
     }}
     a {{ color:inherit; }}
     .shell {{ width:min(1480px, calc(100% - 48px)); margin:0 auto; padding:24px 0 48px; }}
     .app-frame {{ display:grid; grid-template-columns:232px minmax(0,1fr); gap:28px; align-items:start; }}
-    .sidebar {{ position:sticky; top:24px; display:flex; flex-direction:column; gap:24px; padding:18px 14px; min-height:calc(100vh - 72px); background:rgba(14,18,28,.86); border:1px solid var(--line); border-radius:24px; box-shadow:var(--shadow); }}
+    .sidebar {{ position:sticky; top:24px; display:flex; flex-direction:column; gap:25px; padding:20px 13px; min-height:calc(100vh - 72px); background:linear-gradient(180deg,rgba(17,26,43,.97),rgba(11,16,27,.96)); border:1px solid rgba(148,163,184,.17); border-radius:26px; box-shadow:var(--shadow); }}
     .workspace {{ min-width:0; }}
     .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:16px; position:sticky; top:0; z-index:10; margin-bottom:24px; padding:10px 4px 16px; backdrop-filter:blur(18px); }}
     .topbar-context {{ display:grid; gap:4px; }}
@@ -879,10 +880,13 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .brand strong {{ display:block; font-size:17px; }} .brand span span {{ color:var(--muted); font-size:13px; }}
     .nav,.periods,.actions,.mini-form {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
     .sidebar .nav {{ display:grid; gap:6px; align-content:start; }}
-    .nav-link,.btn,.tab {{ border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); text-decoration:none; border-radius:12px; padding:10px 13px; font-weight:800; font-size:14px; }}
+    .nav-link,.btn,.tab {{ border:1px solid transparent; background:transparent; color:var(--muted); text-decoration:none; border-radius:12px; padding:11px 13px; font-weight:800; font-size:14px; }}
     .nav-link,.btn,.tab {{ transition:background .18s ease, border-color .18s ease, transform .18s ease; }}
-    .nav-link:hover,.btn:hover,.tab:hover {{ border-color:rgba(245,196,81,.42); transform:translateY(-1px); }}
-    .nav-link.active,.btn.primary,.tab.active {{ background:linear-gradient(135deg,var(--gold),#e19b31); color:#1d1405; border-color:rgba(245,196,81,.65); }}
+    .nav-link:hover,.btn:hover,.tab:hover {{ border-color:rgba(110,215,232,.24); color:var(--text); transform:translateY(-1px); }}
+    .nav-link.active,.btn.primary,.tab.active {{ background:linear-gradient(135deg,rgba(110,215,232,.18),rgba(243,201,105,.16)); color:var(--text); border-color:rgba(110,215,232,.35); box-shadow:inset 3px 0 0 var(--cyan); }}
+    .nav-icon {{ display:inline-grid; width:22px; place-items:center; margin-right:8px; color:var(--cyan); font-size:16px; }}
+    .nav-section-label {{ padding:0 13px; color:#5f718b; font-size:10px; font-weight:900; letter-spacing:.16em; text-transform:uppercase; }}
+    .events-label {{ margin-top:5px; }} .admin-label {{ margin-top:auto; }}
     .nav-group {{ position:relative; width:100%; }}
     .nav-group summary {{ cursor:pointer; list-style:none; user-select:none; }}
     .nav-group summary::-webkit-details-marker {{ display:none; }}
@@ -893,9 +897,9 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .nav-sub-link:hover,.nav-sub-link.active {{ color:var(--text); background:rgba(245,196,81,.14); }}
     .nav-sub-link.active {{ color:var(--gold); }}
     .hero {{ display:grid; grid-template-columns:1.2fr .8fr; gap:18px; align-items:stretch; margin:8px 0 18px; }}
-    .hero-card,.panel,.card {{ background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--line); border-radius:22px; box-shadow:var(--shadow); }}
+    .hero-card,.panel,.card {{ background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--line); border-radius:20px; box-shadow:var(--shadow); }}
     .hero-card {{ padding:24px; overflow:hidden; position:relative; }}
-    h1 {{ margin:0; font-size:clamp(30px,5vw,54px); line-height:1.02; letter-spacing:-.04em; }}
+    h1 {{ margin:0; font-size:clamp(30px,4vw,48px); line-height:1.02; letter-spacing:-.045em; }}
     h2 {{ margin:0 0 12px; font-size:20px; }} h3 {{ margin:0 0 10px; font-size:16px; color:var(--gold); }}
     .subtitle {{ color:var(--muted); margin-top:10px; max-width:720px; font-size:15px; line-height:1.5; }}
     .periods {{ margin-top:18px; }} .tab {{ color:var(--muted); }} .tab.active {{ color:#1d1405; }}
@@ -904,11 +908,11 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     input,select {{ width:100%; border:1px solid var(--line); background:rgba(0,0,0,.26); color:var(--text); border-radius:12px; padding:10px 11px; font:inherit; }}
     button {{ cursor:pointer; }} .danger {{ color:#fff; background:rgba(255,80,80,.18); border-color:rgba(255,80,80,.35); }}
     .cards {{ display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; margin-bottom:18px; }}
-    .card {{ padding:16px; min-height:105px; }} .card span {{ color:var(--muted); font-size:13px; font-weight:800; }} .card strong {{ display:block; margin-top:10px; font-size:clamp(22px,3vw,31px); white-space:nowrap; }}
+    .card {{ padding:18px; min-height:112px; position:relative; overflow:hidden; }} .card::after {{ content:""; position:absolute; left:0; top:0; width:100%; height:2px; background:linear-gradient(90deg,var(--cyan),transparent); opacity:.7; }} .card span {{ color:var(--muted); font-size:12px; font-weight:900; letter-spacing:.08em; text-transform:uppercase; }} .card strong {{ display:block; margin-top:12px; font-size:clamp(22px,3vw,31px); white-space:nowrap; }}
     .grid,.admin-grid {{ display:grid; grid-template-columns:1.35fr .9fr; gap:18px; align-items:start; }}
-    .panel {{ overflow:hidden; }} .panel-head {{ padding:18px 18px 0; display:flex; justify-content:space-between; gap:12px; align-items:center; }} .panel-body {{ padding:18px; }}
+    .panel {{ overflow:hidden; }} .panel-head {{ padding:20px 20px 0; display:flex; justify-content:space-between; gap:12px; align-items:center; }} .panel-body {{ padding:20px; }}
     table {{ width:100%; border-collapse:collapse; }} th,td {{ padding:12px 14px; border-top:1px solid var(--line); text-align:left; white-space:nowrap; }}
-    th {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }} td.num,th.num {{ text-align:right; }} tr:hover td {{ background:rgba(255,255,255,.025); }}
+    th {{ color:#8191a8; font-size:11px; text-transform:uppercase; letter-spacing:.12em; background:rgba(4,8,16,.22); }} td.num,th.num {{ text-align:right; }} tbody tr:hover td {{ background:rgba(110,215,232,.055); }}
     .sort-link {{ color:var(--muted); text-decoration:none; display:inline-flex; align-items:center; gap:5px; }}
     .sort-link.active {{ color:var(--gold); }}
     .sort-link:hover {{ color:var(--text); }}
