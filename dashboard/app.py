@@ -845,6 +845,13 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     admin_link = f'<a class="nav-link {"active" if active == "admin" else ""}" href="/admin"><span class="nav-icon">⚙</span>Admin</a>'
     nav_html = '<div class="nav-section-label">Prehľad</div>' + nav_html + '<div class="nav-section-label events-label">Udalosti</div>' + events_nav + '<div class="nav-section-label admin-label">Správa</div>' + admin_link
     access_label = "admin" if active == "admin" else "read-only"
+    mobile_nav = f'''<nav class="mobile-nav" aria-label="Mobilná navigácia">
+      <a class="mobile-nav-item {"active" if active == "dashboard" else ""}" href="/"><span>⌂</span>Prehľad</a>
+      <a class="mobile-nav-item {"active" if active == "might" else ""}" href="/?tab=moc"><span>◈</span>Moc</a>
+      <a class="mobile-nav-item {"active" if event_active else ""}" href="/?tab=nomadi"><span>⚔</span>Eventy</a>
+      <a class="mobile-nav-item {"active" if active == "loot" else ""}" href="/?tab=rabovanie"><span>▥</span>Loot</a>
+      <a class="mobile-nav-item {"active" if active == "admin" else ""}" href="/admin"><span>⚙</span>Admin</a>
+    </nav>'''
     return f"""<!doctype html>
 <html lang="sk">
 <head>
@@ -871,6 +878,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .app-frame {{ display:grid; grid-template-columns:232px minmax(0,1fr); gap:28px; align-items:start; }}
     .sidebar {{ position:sticky; top:24px; display:flex; flex-direction:column; gap:25px; padding:20px 13px; min-height:calc(100vh - 72px); background:linear-gradient(180deg,rgba(17,26,43,.97),rgba(11,16,27,.96)); border:1px solid rgba(148,163,184,.17); border-radius:26px; box-shadow:var(--shadow); }}
     .workspace {{ min-width:0; }}
+    .mobile-nav {{ display:none; }}
     .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:16px; position:sticky; top:0; z-index:10; margin-bottom:24px; padding:10px 4px 16px; backdrop-filter:blur(18px); }}
     .topbar-context {{ display:grid; gap:4px; }}
     .topbar-context strong {{ font-size:18px; letter-spacing:-.02em; }}
@@ -942,7 +950,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
       th,td {{ padding:14px 16px; }}
       .cards {{ gap:14px; }}
     }}
-    @media (max-width:1050px) {{ .app-frame {{ display:block; }} .sidebar {{ position:static; min-height:0; margin-bottom:18px; padding:14px; }} .sidebar .nav {{ display:flex; }} .sidebar .nav-link {{ border-radius:999px; }} .nav-menu {{ position:absolute; left:0; top:calc(100% + 6px); margin:0; padding:7px; min-width:190px; background:rgba(20,24,35,.98); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); z-index:20; }} .hero,.grid,.admin-grid {{ grid-template-columns:1fr; }} .cards {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
+    @media (max-width:1050px) {{ .app-frame {{ display:block; }} .sidebar {{ display:none; }} .mobile-nav {{ position:fixed; display:grid; grid-template-columns:repeat(5,1fr); left:12px; right:12px; bottom:12px; z-index:30; padding:7px; background:rgba(12,18,30,.96); border:1px solid rgba(148,163,184,.22); border-radius:18px; box-shadow:0 18px 50px rgba(0,0,0,.45); backdrop-filter:blur(18px); }} .mobile-nav-item {{ display:grid; justify-items:center; gap:3px; padding:8px 4px; border-radius:12px; color:var(--muted); text-decoration:none; font-size:10px; font-weight:900; }} .mobile-nav-item span {{ color:var(--cyan); font-size:17px; line-height:1; }} .mobile-nav-item.active {{ color:var(--text); background:rgba(110,215,232,.13); }} .workspace {{ padding-bottom:86px; }} .nav-menu {{ position:absolute; left:0; top:calc(100% + 6px); margin:0; padding:7px; min-width:190px; background:rgba(20,24,35,.98); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); z-index:20; }} .hero,.grid,.admin-grid {{ grid-template-columns:1fr; }} .cards {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
     @media (max-width:680px) {{ .shell {{ width:min(100% - 18px,1320px); padding-top:12px; }} .topbar {{ align-items:flex-start; flex-direction:column; }} .cards {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .panel {{ overflow-x:auto; }} th,td {{ padding:10px; }} .report-item {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
@@ -958,6 +966,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
       <footer>Public mód je read-only. Admin akcie sú chránené heslom a zapisujú priamo do rovnakej databázy ako Discord bot.</footer>
     </section>
   </div></main>
+  {mobile_nav}
   <script>
     document.addEventListener("submit", function (event) {{
       const form = event.target;
