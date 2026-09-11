@@ -872,6 +872,8 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .brand strong {{ display:block; font-size:17px; }} .brand span span {{ color:var(--muted); font-size:13px; }}
     .nav,.periods,.actions,.mini-form {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
     .nav-link,.btn,.tab {{ border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); text-decoration:none; border-radius:999px; padding:9px 13px; font-weight:800; font-size:14px; }}
+    .nav-link,.btn,.tab {{ transition:background .18s ease, border-color .18s ease, transform .18s ease; }}
+    .nav-link:hover,.btn:hover,.tab:hover {{ border-color:rgba(245,196,81,.42); transform:translateY(-1px); }}
     .nav-link.active,.btn.primary,.tab.active {{ background:linear-gradient(135deg,var(--gold),#e19b31); color:#1d1405; border-color:rgba(245,196,81,.65); }}
     .nav-group {{ position:relative; }}
     .nav-group summary {{ cursor:pointer; list-style:none; user-select:none; }}
@@ -917,6 +919,18 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .page-link {{ min-width:38px; text-align:center; border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); text-decoration:none; border-radius:12px; padding:8px 11px; font-weight:900; }}
     .page-link.active {{ background:linear-gradient(135deg,var(--gold),#e19b31); color:#1d1405; border-color:rgba(245,196,81,.65); }}
     footer {{ color:var(--muted); margin-top:22px; font-size:13px; }}
+    @media (min-width:1051px) {{
+      .shell {{ width:min(1480px, calc(100% - 64px)); padding-top:18px; }}
+      .topbar {{ margin:0 -18px 26px; padding:14px 18px; border:1px solid rgba(255,255,255,.08); border-radius:18px; background:rgba(12,16,25,.78); box-shadow:0 12px 34px rgba(0,0,0,.2); }}
+      .brand {{ min-width:255px; }}
+      .brand strong {{ font-size:18px; letter-spacing:.01em; }}
+      .nav {{ justify-content:flex-end; gap:9px; }}
+      .nav-link {{ padding:10px 15px; }}
+      .hero-card {{ padding:28px; }}
+      .panel-head {{ padding:20px 22px 0; }}
+      th,td {{ padding:14px 16px; }}
+      .cards {{ gap:14px; }}
+    }}
     @media (max-width:1050px) {{ .hero,.grid,.admin-grid {{ grid-template-columns:1fr; }} .cards {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
     @media (max-width:680px) {{ .shell {{ width:min(100% - 18px,1320px); padding-top:12px; }} .topbar {{ align-items:flex-start; flex-direction:column; }} .cards {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .panel {{ overflow-x:auto; }} th,td {{ padding:10px; }} .report-item {{ grid-template-columns:1fr; }} }}
   </style>
