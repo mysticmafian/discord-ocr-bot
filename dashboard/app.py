@@ -967,6 +967,8 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .nav-icon {{ color:#e6b84f; }}
     .nav-sub-link {{ color:#9eb0c5; border-radius:7px; }} .nav-sub-link:hover,.nav-sub-link.active {{ color:#fff; background:#243b59; }} .nav-sub-link.active {{ color:#e6b84f; }}
     .topbar {{ margin-bottom:26px; padding:0 0 18px; border-bottom:1px solid var(--line); backdrop-filter:none; }}
+    .theme-toggle {{ display:inline-flex; align-items:center; gap:7px; border:1px solid #cbd5e1; border-radius:8px; padding:8px 11px; background:#fff; color:#314258; font:inherit; font-size:13px; font-weight:800; cursor:pointer; }}
+    .theme-toggle:hover {{ border-color:#87bfc8; background:#f1f8fa; }}
     .eyebrow {{ color:var(--cyan); }} .topbar-context strong {{ font-size:22px; }}
     .pill {{ border-radius:6px; padding:5px 8px; background:#f3f6f9; border-color:var(--line); color:var(--muted); }}
     .hero {{ gap:20px; margin:0 0 20px; }}
@@ -984,6 +986,9 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .notice {{ background:#eaf7f0; border-color:#b8e0c8; color:#17613e; }}
     footer {{ color:#8795a7; }}
     @media (max-width:1050px) {{ .shell {{ width:min(100% - 24px,1320px); }} .mobile-nav {{ background:#15243a; border:0; box-shadow:0 12px 30px rgba(22,34,53,.22); }} .mobile-nav-item {{ color:#aebed0; }} .mobile-nav-item span {{ color:#e6b84f; }} .mobile-nav-item.active {{ color:#fff; background:#243b59; }} }}
+    body.dark {{ color-scheme:dark; --bg:#0b111b; --panel:#131d2c; --panel2:#172437; --line:#2b3a4e; --text:#edf3fa; --muted:#9aabc0; --gold:#e6b84f; --cyan:#70d5e6; --green:#7ee2a8; --red:#ff8492; --shadow:0 12px 34px rgba(0,0,0,.28); }}
+    body.dark .sidebar {{ background:#0f1b2b; }} body.dark .hero-card,body.dark .panel,body.dark .card {{ background:linear-gradient(180deg,var(--panel2),var(--panel)); border-color:var(--line); }}
+    body.dark .filters,body.dark th {{ background:#101a29; }} body.dark input,body.dark select,body.dark .btn,body.dark .theme-toggle {{ background:#172437; color:var(--text); border-color:var(--line); }} body.dark .pill {{ background:#1a283b; border-color:var(--line); }} body.dark table {{ background:var(--panel); }} body.dark .tab {{ background:#172437; color:var(--muted); border-color:var(--line); }} body.dark .tab.active {{ background:#087f91; color:#fff; }} body.dark .player-link {{ color:#8bd6e0; }}
   </style>
 </head>
 <body>
@@ -993,13 +998,31 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
       <nav class="nav">{nav_html}</nav>
     </aside>
     <section class="workspace">
-      <header class="topbar"><div class="topbar-context"><span class="eyebrow">Royal Soldiers · GGE tracker</span><strong>{esc(title)}</strong></div><span class="pill">{esc(access_label)}</span></header>
+      <header class="topbar"><div class="topbar-context"><span class="eyebrow">Royal Soldiers · GGE tracker</span><strong>{esc(title)}</strong></div><div class="actions"><button class="theme-toggle" id="themeToggle" type="button" aria-label="Prepnúť farebný režim"><span id="themeIcon">☾</span><span id="themeLabel">Tmavý režim</span></button><span class="pill">{esc(access_label)}</span></div></header>
       {body}
       <footer>Public mód je read-only. Admin akcie sú chránené heslom a zapisujú priamo do rovnakej databázy ako Discord bot.</footer>
     </section>
   </div></main>
   {mobile_nav}
   <script>
+    (function () {{
+      const body = document.body;
+      const toggle = document.getElementById("themeToggle");
+      const icon = document.getElementById("themeIcon");
+      const label = document.getElementById("themeLabel");
+      function applyTheme(dark) {{
+        body.classList.toggle("dark", dark);
+        if (icon) icon.textContent = dark ? "☀" : "☾";
+        if (label) label.textContent = dark ? "Svetlý režim" : "Tmavý režim";
+      }}
+      const saved = window.localStorage.getItem("rs-theme");
+      applyTheme(saved === "dark");
+      if (toggle) toggle.addEventListener("click", function () {{
+        const dark = !body.classList.contains("dark");
+        applyTheme(dark);
+        window.localStorage.setItem("rs-theme", dark ? "dark" : "light");
+      }});
+    }})();
     document.addEventListener("submit", function (event) {{
       const form = event.target;
       if (!(form instanceof HTMLFormElement)) return;
