@@ -840,7 +840,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
         for slug, config in EVENT_TYPES.items()
     )
     report_link = f'<a class="nav-sub-link {"active" if active == "dashboard" else ""}" href="/"><span>▤</span>Prehľad reportov</a>'
-    events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}"><span class="nav-icon">⚔</span>Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{report_link}{event_links}</div></details>'
+    events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}"><span class="nav-icon">⚔</span>Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{event_links}{report_link}</div></details>'
     admin_link = f'<details class="nav-group" {"open" if active == "admin" else ""}><summary class="nav-link {"active" if active == "admin" else ""}"><span class="nav-icon">⚙</span>Admin <span class="nav-chevron">⌄</span></summary><div class="nav-menu"><a class="nav-sub-link {"active" if active == "admin" else ""}" href="/admin"><span>◉</span>Nastavenie prehľadu reportov</a></div></details>'
     nav_html = '<div class="nav-section-label">Štatistiky</div>' + nav_html + '<div class="nav-section-label events-label">Udalosti</div>' + events_nav + '<div class="nav-section-label admin-label">Správa</div>' + admin_link
     access_label = "admin" if active == "admin" else "read-only"
