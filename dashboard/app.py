@@ -843,6 +843,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     )
     events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}">⚔️ Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{event_links}</div></details>'
     nav_html = nav_html.replace(f'<a class="nav-link {"active" if active == "admin" else ""}" href="/admin">Admin</a>', events_nav + f'<a class="nav-link {"active" if active == "admin" else ""}" href="/admin">Admin</a>')
+    access_label = "admin" if active == "admin" else "read-only"
     return f"""<!doctype html>
 <html lang="sk">
 <head>
@@ -948,7 +949,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
       <nav class="nav">{nav_html}</nav>
     </aside>
     <section class="workspace">
-      <header class="topbar"><div class="topbar-context"><span class="eyebrow">Royal Soldiers · GGE tracker</span><strong>{esc(title)}</strong></div><span class="pill">read-only</span></header>
+      <header class="topbar"><div class="topbar-context"><span class="eyebrow">Royal Soldiers · GGE tracker</span><strong>{esc(title)}</strong></div><span class="pill">{esc(access_label)}</span></header>
       {body}
       <footer>Public mód je read-only. Admin akcie sú chránené heslom a zapisujú priamo do rovnakej databázy ako Discord bot.</footer>
     </section>
