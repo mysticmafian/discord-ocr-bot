@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import csv
 import html
-import io
 import json
 import os
 import secrets
@@ -17,7 +15,7 @@ from urllib.parse import parse_qs, quote, urlencode
 
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 
@@ -832,17 +830,19 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
         ("dashboard", "/", "Dashboard"),
         ("might", "/?tab=moc", "Moc"),
         ("loot", "/?tab=rabovanie", "Rabovanie"),
-        ("nomadi", "/?tab=nomadi", "Nomádi"),
-        ("samuraji", "/?tab=samuraji", "Samuraji"),
-        ("cudzinci", "/?tab=cudzinci", "Cudzinci"),
-        ("vrany", "/?tab=vrany", "Vrany"),
-        ("export", "/export.csv", "CSV export"),
         ("admin", "/admin", "Admin"),
     ]
     nav_html = "".join(
         f'<a class="nav-link {"active" if key == active else ""}" href="{href}">{label}</a>'
         for key, href, label in nav
     )
+    event_active = active in EVENT_TYPES
+    event_links = "".join(
+        f'<a class="nav-sub-link {"active" if slug == active else ""}" href="/?tab={esc(slug)}"><span>{esc(config["emoji"])}</span>{esc(config["nav"])}</a>'
+        for slug, config in EVENT_TYPES.items()
+    )
+    events_nav = f'<details class="nav-group" {"open" if event_active else ""}><summary class="nav-link {"active" if event_active else ""}">⚔️ Eventy <span class="nav-chevron">⌄</span></summary><div class="nav-menu">{event_links}</div></details>'
+    nav_html = nav_html.replace(f'<a class="nav-link {"active" if active == "admin" else ""}" href="/admin">Admin</a>', events_nav + f'<a class="nav-link {"active" if active == "admin" else ""}" href="/admin">Admin</a>')
     return f"""<!doctype html>
 <html lang="sk">
 <head>
@@ -873,6 +873,15 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .nav,.periods,.actions,.mini-form {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
     .nav-link,.btn,.tab {{ border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); text-decoration:none; border-radius:999px; padding:9px 13px; font-weight:800; font-size:14px; }}
     .nav-link.active,.btn.primary,.tab.active {{ background:linear-gradient(135deg,var(--gold),#e19b31); color:#1d1405; border-color:rgba(245,196,81,.65); }}
+    .nav-group {{ position:relative; }}
+    .nav-group summary {{ cursor:pointer; list-style:none; user-select:none; }}
+    .nav-group summary::-webkit-details-marker {{ display:none; }}
+    .nav-chevron {{ display:inline-block; margin-left:4px; font-size:16px; transition:transform .2s ease; }}
+    .nav-group[open] .nav-chevron {{ transform:rotate(180deg); }}
+    .nav-menu {{ position:absolute; right:0; top:calc(100% + 8px); min-width:190px; padding:7px; display:grid; gap:4px; background:rgba(20,24,35,.98); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); z-index:20; }}
+    .nav-sub-link {{ display:flex; align-items:center; gap:9px; padding:10px 11px; border-radius:10px; color:var(--muted); text-decoration:none; font-size:14px; font-weight:800; }}
+    .nav-sub-link:hover,.nav-sub-link.active {{ color:var(--text); background:rgba(245,196,81,.14); }}
+    .nav-sub-link.active {{ color:var(--gold); }}
     .hero {{ display:grid; grid-template-columns:1.2fr .8fr; gap:18px; align-items:stretch; margin:8px 0 18px; }}
     .hero-card,.panel,.card {{ background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--line); border-radius:22px; box-shadow:var(--shadow); }}
     .hero-card {{ padding:24px; overflow:hidden; position:relative; }}
@@ -1733,7 +1742,7 @@ def render_dashboard(data: dict[str, Any], period: str, date_from: str | None, d
     <section class="cards">{render_cards(data["alliance"], data["blacklist_count"])}</section>
     <section class="grid">
       <div class="panel">
-        <div class="panel-head"><h2>Leaderboard</h2><a class="btn" href="/export.csv?{query_string(period, date_from, date_to)}">Stiahnuť CSV</a></div>
+        <div class="panel-head"><h2>Leaderboard</h2><span class="pill">podľa killov</span></div>
         {render_leaderboard(data["leaderboard"], period, date_from, date_to)}
       </div>
       <div class="panel"><div class="panel-head"><h2>Vývoj aktivity</h2></div><div class="panel-body">{render_chart(data["chart"])}</div></div>
@@ -1870,7 +1879,7 @@ def render_admin(data: dict[str, Any], message: str | None = None) -> str:
       </div></div>
       <details class="panel"><summary class="panel-head"><h2>Blacklist reportov</h2><span class="pill">Klikni pre rozbalenie</span></summary><table><thead><tr><th>Čas</th><th class="num">Killy</th><th class="num">Straty</th><th>Admin</th><th class="num">Message</th><th>Akcia</th></tr></thead><tbody>{blacklist_table}</tbody></table></details>
     </section>
-    <section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Report history</h2><div class="actions"><span class="pill">{first_report}–{last_report} z {report_count}</span><a class="btn" href="/admin/reports.csv">CSV reporty</a></div></div><table><thead><tr><th>Čas</th><th>Hráč</th><th class="num">Killy</th><th class="num">Straty</th><th class="num">Ratio</th><th class="num">Message</th><th>Akcie</th></tr></thead><tbody>{report_table}</tbody></table>{pagination}</section>
+    <section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Report history</h2><div class="actions"><span class="pill">{first_report}–{last_report} z {report_count}</span></div></div><table><thead><tr><th>Čas</th><th>Hráč</th><th class="num">Killy</th><th class="num">Straty</th><th class="num">Ratio</th><th class="num">Message</th><th>Akcie</th></tr></thead><tbody>{report_table}</tbody></table>{pagination}</section>
     """
     return layout("Admin · GGE Report Dashboard", body, active="admin")
 
@@ -1967,14 +1976,6 @@ async def reset_player(player_id: int, period: str) -> int:
     return int(status.rsplit(" ", 1)[-1])
 
 
-def csv_response(filename: str, headers: list[str], rows: list[list[Any]]) -> Response:
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(headers)
-    writer.writerows(rows)
-    return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
-
 def admin_redirect(message: str) -> RedirectResponse:
     return RedirectResponse(f"/admin?{urlencode({'message': message})}", status_code=303)
 
@@ -2045,18 +2046,6 @@ async def event_page(event_slug: str, request: Request):
     return HTMLResponse(render_event_page(data))
 
 
-@app.get("/export.csv")
-async def export_csv(request: Request):
-    period, date_from, date_to = get_filters(request)
-    data = await fetch_dashboard_data(period=period, date_from=date_from, date_to=date_to)
-    rows = []
-    for index, row in enumerate(data["leaderboard"], start=1):
-        losses = int(row["total_losses"] or 0)
-        kills = int(row["total_kills"] or 0)
-        rows.append([index, int(row["player_id"]), row["player_name"], int(row["report_count"] or 0), kills, losses, fmt_ratio(losses, kills)])
-    return csv_response("gge-leaderboard.csv", ["rank", "player_id", "player_name", "reports", "kills", "losses", "ratio"], rows)
-
-
 @app.get("/api/summary")
 async def api_summary(request: Request):
     period, date_from, date_to = get_filters(request)
@@ -2078,26 +2067,6 @@ async def api_summary(request: Request):
 async def admin(page: int = 1, message: str | None = None, user: str = Depends(require_auth)):
     data = await fetch_admin_data(page=page)
     return HTMLResponse(render_admin(data, message))
-
-
-@app.get("/admin/reports.csv")
-async def admin_reports_csv(user: str = Depends(require_auth)):
-    data = await fetch_admin_data(report_limit=100)
-    rows = [
-        [
-            row["created_at"].isoformat(),
-            int(row["guild_id"]),
-            int(row["message_id"]),
-            int(row["attachment_id"]),
-            int(row["player_id"]),
-            row["player_name"],
-            int(row["enemy_kills"]),
-            int(row["own_losses"]),
-            fmt_ratio(int(row["own_losses"]), int(row["enemy_kills"])),
-        ]
-        for row in data["reports"]
-    ]
-    return csv_response("gge-reports.csv", ["created_at", "guild_id", "message_id", "attachment_id", "player_id", "player_name", "kills", "losses", "ratio"], rows)
 
 
 @app.post("/admin/release")
