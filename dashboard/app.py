@@ -989,6 +989,7 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     body.dark {{ color-scheme:dark; --bg:#0b111b; --panel:#131d2c; --panel2:#172437; --line:#2b3a4e; --text:#edf3fa; --muted:#9aabc0; --gold:#e6b84f; --cyan:#70d5e6; --green:#7ee2a8; --red:#ff8492; --shadow:0 12px 34px rgba(0,0,0,.28); }}
     body.dark .sidebar {{ background:#0f1b2b; }} body.dark .hero-card,body.dark .panel,body.dark .card {{ background:linear-gradient(180deg,var(--panel2),var(--panel)); border-color:var(--line); }}
     body.dark .filters,body.dark th {{ background:#101a29; }} body.dark input,body.dark select,body.dark .btn,body.dark .theme-toggle {{ background:#172437; color:var(--text); border-color:var(--line); }} body.dark .pill {{ background:#1a283b; border-color:var(--line); }} body.dark table {{ background:var(--panel); }} body.dark .tab {{ background:#172437; color:var(--muted); border-color:var(--line); }} body.dark .tab.active {{ background:#087f91; color:#fff; }} body.dark .player-link {{ color:#8bd6e0; }}
+    body.dark .nav-link:hover,body.dark .btn:hover,body.dark .tab:hover,body.dark .theme-toggle:hover {{ background:#1d3047; color:var(--text); border-color:#38536f; }} body.dark .tab.active:hover {{ background:#0b8da0; color:#fff; }} body.dark tbody tr:hover td {{ background:#1b2a3e; color:var(--text); }}
   </style>
 </head>
 <body>
