@@ -865,22 +865,29 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
       color:var(--text);
     }}
     a {{ color:inherit; }}
-    .shell {{ width:min(1320px, calc(100% - 28px)); margin:0 auto; padding:22px 0 48px; }}
-    .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:16px; position:sticky; top:0; z-index:10; padding:12px 0 18px; backdrop-filter:blur(18px); }}
+    .shell {{ width:min(1480px, calc(100% - 48px)); margin:0 auto; padding:24px 0 48px; }}
+    .app-frame {{ display:grid; grid-template-columns:232px minmax(0,1fr); gap:28px; align-items:start; }}
+    .sidebar {{ position:sticky; top:24px; display:flex; flex-direction:column; gap:24px; padding:18px 14px; min-height:calc(100vh - 72px); background:rgba(14,18,28,.86); border:1px solid var(--line); border-radius:24px; box-shadow:var(--shadow); }}
+    .workspace {{ min-width:0; }}
+    .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:16px; position:sticky; top:0; z-index:10; margin-bottom:24px; padding:10px 4px 16px; backdrop-filter:blur(18px); }}
+    .topbar-context {{ display:grid; gap:4px; }}
+    .topbar-context strong {{ font-size:18px; letter-spacing:-.02em; }}
+    .eyebrow {{ color:var(--gold); font-size:11px; font-weight:900; letter-spacing:.14em; text-transform:uppercase; }}
     .brand {{ display:flex; align-items:center; gap:12px; text-decoration:none; }}
     .crest {{ width:42px; height:42px; border-radius:12px; display:grid; place-items:center; background:linear-gradient(135deg,#f5c451,#7b4a12); color:#1a1205; box-shadow:var(--shadow); font-size:24px; }}
     .brand strong {{ display:block; font-size:17px; }} .brand span span {{ color:var(--muted); font-size:13px; }}
     .nav,.periods,.actions,.mini-form {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
-    .nav-link,.btn,.tab {{ border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); text-decoration:none; border-radius:999px; padding:9px 13px; font-weight:800; font-size:14px; }}
+    .sidebar .nav {{ display:grid; gap:6px; align-content:start; }}
+    .nav-link,.btn,.tab {{ border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); text-decoration:none; border-radius:12px; padding:10px 13px; font-weight:800; font-size:14px; }}
     .nav-link,.btn,.tab {{ transition:background .18s ease, border-color .18s ease, transform .18s ease; }}
     .nav-link:hover,.btn:hover,.tab:hover {{ border-color:rgba(245,196,81,.42); transform:translateY(-1px); }}
     .nav-link.active,.btn.primary,.tab.active {{ background:linear-gradient(135deg,var(--gold),#e19b31); color:#1d1405; border-color:rgba(245,196,81,.65); }}
-    .nav-group {{ position:relative; }}
+    .nav-group {{ position:relative; width:100%; }}
     .nav-group summary {{ cursor:pointer; list-style:none; user-select:none; }}
     .nav-group summary::-webkit-details-marker {{ display:none; }}
     .nav-chevron {{ display:inline-block; margin-left:4px; font-size:16px; transition:transform .2s ease; }}
     .nav-group[open] .nav-chevron {{ transform:rotate(180deg); }}
-    .nav-menu {{ position:absolute; right:0; top:calc(100% + 8px); min-width:190px; padding:7px; display:grid; gap:4px; background:rgba(20,24,35,.98); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); z-index:20; }}
+    .nav-menu {{ display:grid; gap:4px; margin:5px 0 2px 10px; padding-left:8px; border-left:1px solid rgba(245,196,81,.25); }}
     .nav-sub-link {{ display:flex; align-items:center; gap:9px; padding:10px 11px; border-radius:10px; color:var(--muted); text-decoration:none; font-size:14px; font-weight:800; }}
     .nav-sub-link:hover,.nav-sub-link.active {{ color:var(--text); background:rgba(245,196,81,.14); }}
     .nav-sub-link.active {{ color:var(--gold); }}
@@ -920,29 +927,32 @@ def layout(title: str, body: str, *, active: str = "dashboard") -> str:
     .page-link.active {{ background:linear-gradient(135deg,var(--gold),#e19b31); color:#1d1405; border-color:rgba(245,196,81,.65); }}
     footer {{ color:var(--muted); margin-top:22px; font-size:13px; }}
     @media (min-width:1051px) {{
-      .shell {{ width:min(1480px, calc(100% - 64px)); padding-top:18px; }}
-      .topbar {{ margin:0 -18px 26px; padding:14px 18px; border:1px solid rgba(255,255,255,.08); border-radius:18px; background:rgba(12,16,25,.78); box-shadow:0 12px 34px rgba(0,0,0,.2); }}
-      .brand {{ min-width:255px; }}
+      .shell {{ width:min(1480px, calc(100% - 64px)); padding-top:26px; }}
+      .brand {{ padding:4px 7px; }}
       .brand strong {{ font-size:18px; letter-spacing:.01em; }}
-      .nav {{ justify-content:flex-end; gap:9px; }}
-      .nav-link {{ padding:10px 15px; }}
+      .nav {{ justify-content:flex-start; gap:9px; }}
+      .nav-link {{ padding:11px 13px; }}
       .hero-card {{ padding:28px; }}
       .panel-head {{ padding:20px 22px 0; }}
       th,td {{ padding:14px 16px; }}
       .cards {{ gap:14px; }}
     }}
-    @media (max-width:1050px) {{ .hero,.grid,.admin-grid {{ grid-template-columns:1fr; }} .cards {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
+    @media (max-width:1050px) {{ .app-frame {{ display:block; }} .sidebar {{ position:static; min-height:0; margin-bottom:18px; padding:14px; }} .sidebar .nav {{ display:flex; }} .sidebar .nav-link {{ border-radius:999px; }} .nav-menu {{ position:absolute; left:0; top:calc(100% + 6px); margin:0; padding:7px; min-width:190px; background:rgba(20,24,35,.98); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); z-index:20; }} .hero,.grid,.admin-grid {{ grid-template-columns:1fr; }} .cards {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
     @media (max-width:680px) {{ .shell {{ width:min(100% - 18px,1320px); padding-top:12px; }} .topbar {{ align-items:flex-start; flex-direction:column; }} .cards {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .panel {{ overflow-x:auto; }} th,td {{ padding:10px; }} .report-item {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
 <body>
-  <main class="shell">
-    <header class="topbar">
+  <main class="shell"><div class="app-frame">
+    <aside class="sidebar">
       <a class="brand" href="/"><span class="crest">♛</span><span><strong>ROYAL SOLDIERS</strong><span>Reporty · ratio · power</span></span></a>
       <nav class="nav">{nav_html}</nav>
-    </header>
-    {body}
-    <footer>Public mód je read-only. Admin akcie sú chránené heslom a zapisujú priamo do rovnakej databázy ako Discord bot.</footer>
+    </aside>
+    <section class="workspace">
+      <header class="topbar"><div class="topbar-context"><span class="eyebrow">Royal Soldiers · GGE tracker</span><strong>{esc(title)}</strong></div><span class="pill">read-only</span></header>
+      {body}
+      <footer>Public mód je read-only. Admin akcie sú chránené heslom a zapisujú priamo do rovnakej databázy ako Discord bot.</footer>
+    </section>
+  </div></main>
   </main>
   <script>
     document.addEventListener("submit", function (event) {{
